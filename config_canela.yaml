@@ -6,27 +6,27 @@ scan:
   dpi: 200
 marcadores:
   tamanho_mm: 5.0
-  margem_mm: 15.0
+  margem_mm: 22.0
   posicoes:
     superior_esquerdo:
-      x: 15.0
-      y: 15.0
+      x: 22.0
+      y: 22.0
     superior_direito:
-      x: 190.0
-      y: 15.0
+      x: 183.0
+      y: 22.0
     inferior_esquerdo:
-      x: 15.0
-      y: 277.0
+      x: 22.0
+      y: 270.0
     inferior_direito:
-      x: 190.0
-      y: 277.0
+      x: 183.0
+      y: 270.0
 circulos:
   raio_mm: 2.5
   borda_pt: 1.5
 layout:
-  alunos_por_pagina: 25
+  alunos_por_pagina: 23
   linha_altura_mm: 8.0
-  primeira_linha_y_mm: 62.8
+  primeira_linha_y_mm: 69.8
   dias:
   - Segunda
   - Terça

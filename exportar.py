@@ -18,11 +18,11 @@ import json
 import cv2
 import numpy as np
 import yaml
-from pdf2image import convert_from_path
 from openpyxl import Workbook
 
 from localizar_marcadores import processar, carregar_marcadores_esperados, encontrar_marcadores, classificar_cantos
 from ler_bolhas import ler_pagina, OFFSET_Y, THRESHOLD
+from utils import converter_pdf
 
 
 # --- MERGE DE PDFs ---
@@ -30,6 +30,9 @@ from ler_bolhas import ler_pagina, OFFSET_Y, THRESHOLD
 def carregar_todas_paginas(*caminhos_pdf, dpi=200):
     """
     Carrega todas as páginas de um ou mais PDFs.
+
+    Se um PDF estiver corrompido, imprime aviso e continua com os demais
+    em vez de abortar tudo.
 
     Args:
         caminhos_pdf: um ou mais caminhos de arquivos PDF
@@ -40,13 +43,27 @@ def carregar_todas_paginas(*caminhos_pdf, dpi=200):
     """
     todas = []
     for caminho in caminhos_pdf:
+        if not os.path.isfile(caminho):
+            print(f"  AVISO: arquivo não encontrado — {caminho}")
+            continue
+
         print(f"Carregando {caminho}...")
-        paginas = convert_from_path(caminho, dpi=dpi)
+        try:
+            paginas = converter_pdf(caminho, dpi=dpi)
+        except Exception as e:
+            print(f"  ERRO ao carregar {caminho}: {e}")
+            print(f"  Este PDF será ignorado.")
+            continue
+
+        n_antes = len(todas)
         for pag in paginas:
             img = np.array(pag)
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             todas.append(img)
-        print(f"  {len(paginas)} páginas carregadas")
+        print(f"  {len(todas) - n_antes} páginas carregadas")
+
+    if not todas:
+        raise RuntimeError("Nenhuma página foi carregada. Verifique os arquivos PDF.")
 
     print(f"Total: {len(todas)} páginas")
     return todas
@@ -77,7 +94,7 @@ def eh_pagina_branca(img, threshold_pct=2.0):
 
 # --- PROCESSAMENTO COMPLETO ---
 
-def processar_pdf_completo(paginas, config):
+def processar_pdf_completo(paginas, config, pagina_inicio=1):
     """
     Processa todas as páginas do scan:
     1. Pula páginas em branco
@@ -87,6 +104,9 @@ def processar_pdf_completo(paginas, config):
     Args:
         paginas: lista de imagens BGR
         config: dict do config.yaml
+        pagina_inicio: número da página do template que a primeira página escaneada representa.
+            Use 1 (padrão) para scans completos sequenciais. Use 3, por exemplo, se você
+            escaneou apenas a página 3 de um formulário de múltiplas páginas.
 
     Returns:
         Lista de resultados por aluno (todas as páginas concatenadas)
@@ -103,7 +123,10 @@ def processar_pdf_completo(paginas, config):
             continue
 
         paginas_processadas += 1
-        print(f"  Processando página {paginas_processadas} (PDF página {i + 1})...")
+        # Página do template correspondente a este scan (pode ser != paginas_processadas
+        # quando o usuário escaneia uma página avulsa, ex: só a página 3 do formulário)
+        pagina_template = pagina_inicio + paginas_processadas - 1
+        print(f"  Processando página {paginas_processadas} (PDF pág {i + 1} → template pág {pagina_template})...")
 
         try:
             # Alinha
@@ -117,9 +140,9 @@ def processar_pdf_completo(paginas, config):
             # Lê bolhas
             resultados = ler_pagina(binary, config, alunos_por_pagina)
 
-            # Ajusta numeração global
+            # Ajusta numeração global com base na página do template
             for r in resultados:
-                r["numero"] = (paginas_processadas - 1) * alunos_por_pagina + r["numero"]
+                r["numero"] = (pagina_template - 1) * alunos_por_pagina + r["numero"]
 
             todos_resultados.extend(resultados)
 
@@ -318,11 +341,16 @@ def aplicar_correcoes(resultados, correcoes):
 
 def main():
     if len(sys.argv) < 5:
-        print("Uso: python exportar.py <scan.pdf> <config.yaml> <planilha_alunos.xlsx> <aba> [--correcoes correcoes.json] [--merge scan2.pdf ...]")
+        print("Uso: python exportar.py <scan.pdf> <config.yaml> <planilha_alunos.xlsx> <aba> [opções]")
+        print()
+        print("Opções:")
+        print("  --merge scan2.pdf ...      Mescla múltiplos PDFs antes de processar")
+        print("  --pagina-inicio N          Página do formulário onde o scan começa (padrão: 1)")
+        print("  --correcoes arquivo.json   Aplica correções manuais da revisão")
         print()
         print("Exemplos:")
         print('  python exportar.py scan.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO"')
-        print('  python exportar.py scan.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --correcoes correcoes.json')
+        print('  python exportar.py scan3.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --pagina-inicio 3')
         print('  python exportar.py scan1.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --merge scan2.pdf')
         sys.exit(1)
 
@@ -342,6 +370,13 @@ def main():
                 break
             extras.append(arg)
         pdfs.extend(extras)
+
+    # Página do template onde começa o scan (padrão 1 = scan completo sequencial)
+    pagina_inicio = 1
+    if "--pagina-inicio" in sys.argv:
+        idx = sys.argv.index("--pagina-inicio")
+        pagina_inicio = int(sys.argv[idx + 1])
+        print(f"Página de início: {pagina_inicio}")
 
     # Checa se tem correções
     correcoes = None
@@ -364,8 +399,8 @@ def main():
 
     # Processa
     print("\n=== Processando páginas ===")
-    resultados = processar_pdf_completo(paginas, config)
-
+    resultados = processar_pdf_completo(paginas, config, pagina_inicio=pagina_inicio)
+    
     # Aplica correções se houver
     if correcoes:
         print("\n=== Aplicando correções ===")

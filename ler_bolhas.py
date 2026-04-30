@@ -19,7 +19,7 @@ OFFSET_Y = -17
 # Proporção mínima de pixels marcados pra considerar preenchido
 # Círculos vazios ficam ~20-22% (só borda), marcados ficam ~50-90%
 # Ajuste pra cima se vazios estão dando ambíguo, pra baixo se marcados não estão sendo detectados
-THRESHOLD = 0.48
+THRESHOLD = 0.36
 
 
 def mm_para_px(valor_mm: float, dpi: int = 200) -> float:

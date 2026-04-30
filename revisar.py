@@ -417,15 +417,25 @@ def main():
     nome_aba = sys.argv[4]
 
     pdfs = [caminho_scan]
-    if "--merge" in sys.argv:
-        idx = sys.argv.index("--merge")
-        pdfs.extend(sys.argv[idx + 1:])
 
     with open(caminho_config, "r") as f:
         config = yaml.safe_load(f)
 
     dias = config["layout"]["dias"]
     alunos_por_pagina = config["layout"]["alunos_por_pagina"]
+
+    if "--merge" in sys.argv:
+        idx = sys.argv.index("--merge")
+        for arg in sys.argv[idx + 1:]:
+            if arg.startswith("--"):
+                break
+            pdfs.append(arg)
+
+    pagina_inicio = 1
+    if "--pagina-inicio" in sys.argv:
+        idx = sys.argv.index("--pagina-inicio")
+        pagina_inicio = int(sys.argv[idx + 1])
+        print(f"Página de início: {pagina_inicio}")
 
     # Carrega
     print("=== Carregando PDFs ===")
@@ -436,13 +446,15 @@ def main():
     paginas_alinhadas = []
     binarios = []
     resultados_por_pagina = []
-    num_global = 0
+    paginas_processadas = 0
 
     for i, img in enumerate(todas_paginas):
         if eh_pagina_branca(img):
             continue
 
-        print(f"  Processando página {len(paginas_alinhadas) + 1} (PDF página {i + 1})...")
+        paginas_processadas += 1
+        pagina_template = pagina_inicio + paginas_processadas - 1
+        print(f"  Processando página {paginas_processadas} (PDF pág {i + 1} → template pág {pagina_template})...")
 
         try:
             alinhada = processar(img, config)
@@ -452,18 +464,17 @@ def main():
 
             resultados = ler_pagina(binary, config, alunos_por_pagina)
 
-            # Ajusta numeração global
+            # Ajusta numeração global com base na página do template
+            offset = (pagina_template - 1) * alunos_por_pagina
             for r in resultados:
-                r["numero"] = num_global + r["numero"]
+                r["numero"] = offset + r["numero"]
 
-            num_global += alunos_por_pagina
             paginas_alinhadas.append(alinhada)
             binarios.append(binary)
             resultados_por_pagina.append(resultados)
 
         except Exception as e:
             print(f"    ERRO: {e}")
-            num_global += alunos_por_pagina
             continue
 
     # Junta todos os resultados

@@ -4,6 +4,7 @@ from openpyxl import load_workbook
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 # --- CONFIGURAÇÕES DE LAYOUT ---
 MARCADOR_TAM = 5 * mm
@@ -16,10 +17,10 @@ CIRCULO_ESPACO_DIA = 9 * mm
 
 LINHA_ALTURA = 8 * mm
 
-FONTE_TITULO = ("Helvetica-Bold", 11)
-FONTE_SUBTITULO = ("Helvetica", 9)
-FONTE_CABECALHO = ("Helvetica-Bold", 7)
-FONTE_CORPO = ("Helvetica", 9)
+FONTE_TITULO = ("Helvetica-Bold", 13)
+FONTE_SUBTITULO = ("Helvetica", 11)
+FONTE_CABECALHO = ("Helvetica-Bold", 9)
+FONTE_CORPO = ("Helvetica", 11)
 
 MARGEM_ESQUERDA = 15 * mm
 MARGEM_DIREITA = 15 * mm
@@ -56,9 +57,10 @@ def ler_planilha(caminho_xlsx: str, nome_aba: str) -> dict:
     wb = load_workbook(caminho_xlsx, read_only=True)
 
     if nome_aba not in wb.sheetnames:
-        print(f"Erro: aba '{nome_aba}' não encontrada.")
-        print(f"Abas disponíveis: {wb.sheetnames}")
-        sys.exit(1)
+        raise ValueError(
+            f"Aba '{nome_aba}' não encontrada. "
+            f"Abas disponíveis: {wb.sheetnames}"
+        )
 
     ws = wb[nome_aba]
 
@@ -159,6 +161,42 @@ def desenhar_cabecalho(c, largura, altura, pagina_atual, total_paginas, info):
     return y
 
 
+def calcular_layout_colunas(posicoes_circulos):
+    """
+    Calcula as posições das colunas Nome e Matrícula em função dos círculos.
+
+    A matrícula é alinhada à DIREITA com 2mm de folga antes do primeiro círculo,
+    garantindo que nunca sobreponha os círculos independente do comprimento do número.
+    O espaço do nome é calculado com base na largura real (pior caso) da matrícula.
+
+    Returns:
+        dict com:
+            nome_x              — X de início do nome
+            nome_largura_max_pt — largura máxima do nome em pontos
+            matricula_right     — borda direita da matrícula (para drawRightString)
+    """
+    nome_x = MARGEM_ESQUERDA + 8 * mm
+
+    # Borda esquerda do primeiro círculo
+    primeiro_circulo_esquerda = posicoes_circulos[0][0] - CIRCULO_RAIO
+
+    # Matrícula: alinhada à direita, 2mm antes do primeiro círculo
+    matricula_right = primeiro_circulo_esquerda - 2 * mm
+
+    # Largura real de uma matrícula de 9 dígitos na fonte atual (pior caso)
+    max_matricula_pt = stringWidth("222117117", FONTE_CORPO[0], FONTE_CORPO[1])
+
+    # Nome: termina 2mm antes da borda esquerda da matrícula no pior caso
+    nome_right_max = matricula_right - max_matricula_pt - 2 * mm
+    nome_largura_max_pt = nome_right_max - nome_x
+
+    return {
+        "nome_x": nome_x,
+        "nome_largura_max_pt": nome_largura_max_pt,
+        "matricula_right": matricula_right,
+    }
+
+
 def calcular_posicoes_circulos(largura, dias):
     """
     Calcula as posições X de cada círculo.
@@ -190,14 +228,15 @@ def calcular_posicoes_circulos(largura, dias):
     return posicoes
 
 
-def desenhar_cabecalho_tabela(c, y, posicoes_circulos, largura, dias):
+def desenhar_cabecalho_tabela(c, y, posicoes_circulos, largura, dias, layout):
     """Desenha o cabeçalho da tabela."""
     c.setFont(*FONTE_CABECALHO)
     c.setFillColor("black")
 
     c.drawString(MARGEM_ESQUERDA, y, "Nº")
-    c.drawString(MARGEM_ESQUERDA + 8 * mm, y, "Nome")
-    c.drawString(78 * mm, y, "Matrícula")
+    c.drawString(layout["nome_x"], y, "Nome")
+    # "Matrícula" alinhada à direita junto com os dados
+    c.drawRightString(layout["matricula_right"], y, "Matrícula")
 
     for i, dia in enumerate(dias):
         x_a, x_j = posicoes_circulos[i]
@@ -219,18 +258,39 @@ def desenhar_cabecalho_tabela(c, y, posicoes_circulos, largura, dias):
     return y
 
 
-def desenhar_linha_aluno(c, y, numero, nome, matricula, posicoes_circulos):
+FONTE_CORPO_MIN = 7  # tamanho mínimo aceitável para nomes longos
+
+
+def _tamanho_para_caber(texto, fonte_nome, tamanho_padrao, largura_max_pt, tamanho_min):
+    """
+    Retorna o maior tamanho de fonte (em steps de 0.5pt) que faz o texto
+    caber em largura_max_pt. Nunca vai abaixo de tamanho_min.
+    """
+    tamanho = tamanho_padrao
+    while tamanho > tamanho_min:
+        if stringWidth(texto, fonte_nome, tamanho) <= largura_max_pt:
+            break
+        tamanho -= 0.5
+    return tamanho
+
+
+def desenhar_linha_aluno(c, y, numero, nome, matricula, posicoes_circulos, layout):
     """Desenha uma linha completa: número, nome, matrícula e círculos."""
-    c.setFont(*FONTE_CORPO)
     c.setFillColor("black")
 
-    nome_max = 38
-    if len(nome) > nome_max:
-        nome = nome[:nome_max - 2] + ".."
+    # Reduz a fonte só nesta linha se o nome não caber no tamanho padrão
+    tamanho_nome = _tamanho_para_caber(
+        nome, FONTE_CORPO[0], FONTE_CORPO[1], layout["nome_largura_max_pt"], FONTE_CORPO_MIN
+    )
 
     c.drawRightString(MARGEM_ESQUERDA + 6 * mm, y, str(numero))
-    c.drawString(MARGEM_ESQUERDA + 8 * mm, y, nome)
-    c.drawString(78 * mm, y, matricula)
+
+    c.setFont(FONTE_CORPO[0], tamanho_nome)
+    c.drawString(layout["nome_x"], y, nome)
+
+    # Matrícula alinhada à direita — nunca ultrapassa a borda dos círculos
+    c.setFont(*FONTE_CORPO)
+    c.drawRightString(layout["matricula_right"], y, matricula)
 
     c.setStrokeColor("black")
     c.setLineWidth(CIRCULO_BORDA)
@@ -262,6 +322,7 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
     largura, altura = A4
 
     posicoes_circulos = calcular_posicoes_circulos(largura, dias)
+    layout = calcular_layout_colunas(posicoes_circulos)
 
     # Calcula quantos alunos cabem por página
     y_limite_inferior = MARCADOR_MARGEM + MARCADOR_TAM + 10 * mm
@@ -280,7 +341,7 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
         y = desenhar_cabecalho(c, largura, altura, pagina_atual, total_paginas, info)
 
         y -= 6 * mm
-        y = desenhar_cabecalho_tabela(c, y, posicoes_circulos, largura, dias)
+        y = desenhar_cabecalho_tabela(c, y, posicoes_circulos, largura, dias, layout)
 
         y -= 5 * mm
         y_topo_tabela = y + 2 * mm
@@ -291,7 +352,7 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
 
         for i, (nome, matricula) in enumerate(alunos_pagina):
             numero = idx_inicio + i + 1
-            desenhar_linha_aluno(c, y, numero, nome, matricula, posicoes_circulos)
+            desenhar_linha_aluno(c, y, numero, nome, matricula, posicoes_circulos, layout)
             y -= LINHA_ALTURA
         y_base_tabela = y + LINHA_ALTURA - 4 * mm
 

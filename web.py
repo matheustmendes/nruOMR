@@ -76,7 +76,6 @@ def encontrar_config(restaurante_key):
 def index():
     return HTML_PAGE
 
-
 @app.route("/processar", methods=["POST"])
 def rota_processar():
     try:
@@ -90,11 +89,13 @@ def rota_processar():
         if not scan_file or not alunos_file:
             return jsonify({"erro": "Envie o scan e a planilha de alunos"}), 400
 
-        # Salva arquivos temporários
+        # Salva arquivos temporários (com correção para Windows)
         scan_tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        scan_tmp.close()
         scan_file.save(scan_tmp.name)
 
         alunos_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        alunos_tmp.close()
         alunos_file.save(alunos_tmp.name)
 
         # Carrega config
@@ -108,9 +109,11 @@ def rota_processar():
         dias = config["layout"]["dias"]
         restaurante = RESTAURANTES[restaurante_key]
 
+        pagina_inicio = int(request.form.get("pagina_inicio", 1) or 1)
+
         # Processa
         paginas = carregar_todas_paginas(scan_tmp.name, dpi=config["scan"]["dpi"])
-        resultados = processar_pdf_completo(paginas, config)
+        resultados = processar_pdf_completo(paginas, config, pagina_inicio=pagina_inicio)
         contagem = contar_presencas(resultados, dias)
         alunos = ler_nomes_alunos(alunos_tmp.name, restaurante["aba"])
 
@@ -123,8 +126,9 @@ def rota_processar():
                     if abs(pct - THRESHOLD) < 0.08:
                         ambiguos += 1
 
-        # Gera xlsx em memória
+        # Gera xlsx em memória (com correção para Windows)
         saida_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        saida_tmp.close()
         exportar_xlsx(contagem, alunos, dias, saida_tmp.name)
 
         # Limpa
@@ -150,7 +154,6 @@ def rota_processar():
         traceback.print_exc()
         return jsonify({"erro": str(e)}), 500
 
-
 @app.route("/gerar_template", methods=["POST"])
 def rota_gerar_template():
     try:
@@ -169,14 +172,19 @@ def rota_gerar_template():
             return jsonify({"erro": "Restaurante inválido"}), 400
 
         alunos_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        alunos_tmp.close()
         alunos_file.save(alunos_tmp.name)
 
         resultados_geracao = []
 
+        aba_override = request.form.get("aba_override", "").strip()
+
         for key in keys:
             rest = RESTAURANTES[key]
+            # Usa aba_override só quando é um único restaurante (não "todos")
+            aba = aba_override if (aba_override and len(keys) == 1) else rest["aba"]
             try:
-                info = ler_planilha(alunos_tmp.name, rest["aba"])
+                info = ler_planilha(alunos_tmp.name, aba)
 
                 if rest["aba"] in CONFIG_ABAS:
                     dias = CONFIG_ABAS[rest["aba"]]
@@ -185,6 +193,7 @@ def rota_gerar_template():
 
                 # PDF temporário
                 pdf_tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+                pdf_tmp.close()
                 resultado = gerar_template(info, dias, pdf_tmp.name)
 
                 # Config no diretório do script
@@ -206,7 +215,10 @@ def rota_gerar_template():
                     "erro": str(e),
                 })
 
-        os.unlink(alunos_tmp.name)
+        try:
+            os.unlink(alunos_tmp.name)
+        except Exception:
+            pass
 
         # Se gerou um só, guarda pra download
         pdfs_ok = [r for r in resultados_geracao if "arquivo" in r]
@@ -247,10 +259,33 @@ def rota_download():
     return send_file(caminho, as_attachment=True, download_name=nome)
 
 
+@app.route("/list_abas", methods=["POST"])
+def rota_list_abas():
+    """Retorna a lista de abas de um arquivo xlsx enviado via POST."""
+    try:
+        from openpyxl import load_workbook
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"abas": []})
+        tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+        tmp.close()
+        f.save(tmp.name)
+        wb = load_workbook(tmp.name, read_only=True)
+        abas = wb.sheetnames
+        wb.close()
+        os.unlink(tmp.name)
+        return jsonify({"abas": list(abas)})
+    except Exception:
+        return jsonify({"abas": []})
+
+
 @app.route("/download/<restaurante>")
 def rota_download_template(restaurante):
     templates = app.config.get("TEMPLATES_GERADOS", {})
     caminho = templates.get(restaurante)
+    if not caminho:
+        # Para restaurante único, o arquivo fica em ULTIMO_RESULTADO
+        caminho = app.config.get("ULTIMO_RESULTADO")
     if not caminho or not os.path.exists(caminho):
         return "Template não encontrado", 404
     return send_file(caminho, as_attachment=True, download_name=f"template_{restaurante}.pdf")
@@ -501,7 +536,7 @@ body {
             <div class="section">
                 <div class="label">Planilha de alunos (.xlsx)</div>
                 <div id="upload-template-zone" class="upload-zone">
-                    <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'template')">
+                    <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'template'); fetchAbas(this)">
                     <div class="upload-icon">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
                     </div>
@@ -513,6 +548,17 @@ body {
                     <div class="file-name" id="file-template-name"></div>
                     <div class="file-remove" onclick="removeFile('template')">remover</div>
                 </div>
+            </div>
+
+            <div class="section" id="aba-section" style="display:none;">
+                <div class="label">Aba da planilha</div>
+                <div style="font-size:12px;color:#888;margin-bottom:8px;">
+                    Abas encontradas no arquivo. Selecione a que contém os dados do restaurante.
+                </div>
+                <select name="aba_override" id="aba-select"
+                    style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #e5e5e3;
+                           font-size:14px;font-family:inherit;background:#fff;outline:none;color:#1a1a1a;">
+                </select>
             </div>
 
             <button type="submit" class="btn" id="btn-template">Gerar template</button>
@@ -564,6 +610,17 @@ body {
             </div>
 
             <div class="section">
+                <div class="label">Página de início</div>
+                <div style="font-size:12px;color:#888;margin-bottom:8px;">
+                    Normalmente deixe em <b>1</b>. Mude só se você escaneou uma página avulsa —
+                    ex: se o scan é a página 3 do formulário, coloque 3.
+                </div>
+                <input type="number" name="pagina_inicio" value="1" min="1"
+                    style="width:80px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;
+                           font-size:14px;font-family:inherit;outline:none;">
+            </div>
+
+            <div class="section">
                 <div class="label">Planilha de alunos (.xlsx)</div>
                 <div id="upload-alunos-zone" class="upload-zone">
                     <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'alunos')">
@@ -612,6 +669,40 @@ body {
 </div>
 
 <script>
+var ABA_PADRAO = {
+    canela: 'CANELA IMPRESSÃO',
+    ondina: 'ONDINA IMPRESSÃO',
+    sao_lazaro: 'SÃO LÁZARO IMPRESSÃO'
+};
+
+function fetchAbas(input) {
+    if (!input.files.length) return;
+    var fd = new FormData();
+    fd.append('file', input.files[0]);
+    fetch('/list_abas', {method: 'POST', body: fd})
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data.abas || !data.abas.length) return;
+            var select = document.getElementById('aba-select');
+            select.innerHTML = '';
+            data.abas.forEach(function(aba) {
+                var opt = document.createElement('option');
+                opt.value = aba;
+                opt.textContent = aba;
+                select.appendChild(opt);
+            });
+
+            // Tenta pré-selecionar a aba padrão do restaurante
+            var restKey = document.querySelector('input[name="rest-template"]:checked').value;
+            var padrao = ABA_PADRAO[restKey] || '';
+            var encontrou = Array.from(select.options).some(function(o) { return o.value === padrao; });
+            select.value = encontrou ? padrao : (data.abas[0] || '');
+
+            document.getElementById('aba-section').style.display = '';
+        })
+        .catch(function() {});
+}
+
 function switchTab(tab) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -629,6 +720,17 @@ function selectRadio(el, name) {
     el.closest('.radio-group').querySelectorAll('.radio').forEach(r => r.classList.remove('selected'));
     el.classList.add('selected');
     el.querySelector('input').checked = true;
+
+    // Atualiza pré-seleção de aba se o arquivo já foi carregado
+    if (name === 'rest-template') {
+        var select = document.getElementById('aba-select');
+        if (select && select.options.length) {
+            var restKey = el.querySelector('input').value;
+            var padrao = ABA_PADRAO[restKey] || '';
+            var encontrou = Array.from(select.options).some(function(o) { return o.value === padrao; });
+            if (encontrou) select.value = padrao;
+        }
+    }
 }
 
 function fileSelected(input, tipo) {
@@ -666,6 +768,11 @@ function submitTemplate(e) {
         return false;
     }
     data.set('alunos', alunos.files[0]);
+
+    var abaSelect = document.getElementById('aba-select');
+    if (abaSelect && abaSelect.value) {
+        data.set('aba_override', abaSelect.value);
+    }
 
     showLoading('template', true);
     hideError('template');
@@ -709,12 +816,14 @@ function submitProcessar(e) {
 
     var scan = form.querySelector('input[name="scan"]');
     var alunos = form.querySelector('input[name="alunos"]');
+    var paginaInicio = form.querySelector('input[name="pagina_inicio"]');
 
     if (!scan.files.length) { showError('processar', 'Selecione o PDF do scan.'); return false; }
     if (!alunos.files.length) { showError('processar', 'Selecione a planilha de alunos.'); return false; }
 
     data.set('scan', scan.files[0]);
     data.set('alunos', alunos.files[0]);
+    data.set('pagina_inicio', paginaInicio ? paginaInicio.value : '1');
 
     showLoading('processar', true);
     hideError('processar');

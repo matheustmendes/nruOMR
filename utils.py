@@ -16,22 +16,19 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def _poppler_path():
     """
     Encontra o Poppler portátil na pasta do projeto.
-    Procura em:
-      1. ./poppler/Library/bin/
-      2. ./poppler/bin/
-      3. ./poppler/
-    Se não encontrar, retorna None (usa o PATH do sistema).
+    Procura recursivamente por pdftoppm.exe dentro da pasta poppler/.
     """
-    candidatos = [
-        os.path.join(SCRIPT_DIR, "poppler", "Library", "bin"),
-        os.path.join(SCRIPT_DIR, "poppler", "bin"),
-        os.path.join(SCRIPT_DIR, "poppler"),
-    ]
-    for c in candidatos:
-        if os.path.isdir(c) and any(
-            f.startswith("pdftoppm") for f in os.listdir(c)
-        ):
-            return c
+    pasta_poppler = os.path.join(SCRIPT_DIR, "poppler")
+    if not os.path.isdir(pasta_poppler):
+        return None
+
+    # Percorre toda a árvore da pasta poppler procurando pdftoppm.exe
+    for raiz, dirs, arquivos in os.walk(pasta_poppler):
+        for arquivo in arquivos:
+            if arquivo.lower().startswith("pdftoppm"):
+                print(f"[utils] Poppler encontrado em: {raiz}")
+                return raiz
+
     return None
 
 
@@ -41,7 +38,8 @@ def converter_pdf(caminho: str, dpi: int = 200) -> list:
     Usa Poppler portátil se disponível.
     """
     poppler = _poppler_path()
-    kwargs = {"dpi": dpi}
     if poppler:
-        kwargs["poppler_path"] = poppler
-    return _convert(caminho, **kwargs)
+        return _convert(caminho, dpi=dpi, poppler_path=poppler)
+    else:
+        print("[utils] Poppler portátil não encontrado, tentando PATH do sistema...")
+        return _convert(caminho, dpi=dpi)

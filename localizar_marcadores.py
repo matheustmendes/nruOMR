@@ -21,17 +21,20 @@ def mm_para_px(valor_mm: float, dpi: int = 200) -> float:
     return (valor_mm / 25.4) * dpi
 
 
-def encontrar_marcadores(binary: np.ndarray) -> list:
+def encontrar_marcadores(binary: np.ndarray, solidez_min: float = 0.80) -> list:
     """
     Encontra os 4 marcadores fiduciais na imagem binarizada.
 
     A detecção usa três filtros:
       1. Área: entre 800 e 5000 px² (5mm a 200dpi ≈ 39px → ~1521px²)
       2. Aspecto: entre 0.7 e 1.3 (deve ser quadrado)
-      3. Solidez: acima de 0.85 (quadrado preenchido vs círculo oco ~0.75)
+      3. Solidez: acima de solidez_min (quadrado preenchido vs círculo oco ~0.75)
+         Padrão 0.80 — mais permissivo que o original 0.85 para tolerar
+         scanners que não preenchem completamente os marcadores.
 
     Args:
         binary: imagem binarizada com BINARY_INV (objetos em branco)
+        solidez_min: solidez mínima para aceitar candidato (padrão 0.80)
 
     Returns:
         Lista de (cx, cy, area, solidez) dos candidatos
@@ -56,7 +59,7 @@ def encontrar_marcadores(binary: np.ndarray) -> list:
 
         # Filtro 3: solidez alta = preenchido (marcador), baixa = oco (círculo)
         solidez = area / (w * h)
-        if solidez < 0.85:
+        if solidez < solidez_min:
             continue
 
         cx = x + w // 2
@@ -64,6 +67,33 @@ def encontrar_marcadores(binary: np.ndarray) -> list:
         candidatos.append((cx, cy, area, solidez))
 
     return candidatos
+
+
+def encontrar_marcadores_com_fallback(binary: np.ndarray, debug: bool = False) -> list:
+    """
+    Tenta encontrar marcadores com threshold progressivamente mais permissivo.
+
+    Tenta solidez 0.80 → 0.72 → 0.65.
+    Se nenhum threshold encontrar 4 candidatos, retorna o melhor resultado.
+
+    Args:
+        binary: imagem binarizada com BINARY_INV
+        debug: se True, imprime qual threshold funcionou
+
+    Returns:
+        Lista de candidatos (pode ter menos de 4 se o scan estiver muito ruim)
+    """
+    for solidez_min in [0.80, 0.72, 0.65]:
+        candidatos = encontrar_marcadores(binary, solidez_min=solidez_min)
+        if len(candidatos) >= 4:
+            if debug:
+                print(f"  Marcadores encontrados com solidez >= {solidez_min}")
+            return candidatos
+
+    # Retorna o que tiver com o threshold mais permissivo
+    if debug:
+        print(f"  AVISO: menos de 4 marcadores encontrados mesmo com solidez >= 0.65")
+    return encontrar_marcadores(binary, solidez_min=0.65)
 
 
 def classificar_cantos(candidatos: list, largura_img: int, altura_img: int) -> dict:
@@ -81,10 +111,16 @@ def classificar_cantos(candidatos: list, largura_img: int, altura_img: int) -> d
         dict com chaves sup_esq, sup_dir, inf_esq, inf_dir
         cada valor é (cx, cy)
     """
-    if len(candidatos) < 4:
+    if len(candidatos) < 1:
+        dica = (
+            "Dicas:\n"
+            "  - Verifique se o scan está em preto e branco (não colorido)\n"
+            "  - Confirme que os quadrados nos cantos estão visíveis no scan\n"
+            "  - Tente aumentar o DPI do scanner (mínimo recomendado: 200 DPI)\n"
+            "  - Use o script de debug: python localizar_marcadores.py scan.pdf config.yaml"
+        )
         raise ValueError(
-            f"Esperados 4 marcadores, encontrados {len(candidatos)}. "
-            "Verifique se o scan está limpo e os marcadores estão visíveis."
+            f"Nenhum marcador encontrado. Não é possível alinhar a página.\n{dica}"
         )
 
     cantos_ref = {
@@ -152,6 +188,77 @@ def carregar_marcadores_esperados(config: dict) -> dict:
     return resultado
 
 
+def completar_marcadores_faltantes(
+    marcadores_reais: dict,
+    marcadores_esperados: dict,
+    debug: bool = False,
+) -> dict:
+    """
+    Estima posições de marcadores não detectados usando os que foram encontrados.
+
+    Escolhe automaticamente o melhor estimador conforme a quantidade disponível:
+
+      3 encontrados → Transformação afim completa (exata para 3 pontos).
+                       Captura rotação, escala não-uniforme, shear e translação.
+
+      2 encontrados → Similaridade (estimateAffinePartial2D): rotação + escala
+                       uniforme + translação. Sem shear. Válida para scanners
+                       porque distorção de shear em scanner é desprezível.
+
+      1 encontrado  → Só translação (assume escala=1, rotação=0). Última linha
+                       de defesa — funciona se o scanner não girou a folha.
+
+    Args:
+        marcadores_reais:     dict parcial com 1–3 marcadores detectados
+        marcadores_esperados: dict completo com as 4 posições ideais (do config)
+        debug: se True, imprime quais marcadores foram estimados e o método usado
+
+    Returns:
+        dict completo com os 4 marcadores (reais + estimados)
+    """
+    ordem = ["superior_esquerdo", "superior_direito", "inferior_esquerdo", "inferior_direito"]
+
+    faltantes = [k for k in ordem if k not in marcadores_reais]
+    if not faltantes:
+        return marcadores_reais
+
+    encontrados = [k for k in ordem if k in marcadores_reais]
+    n = len(encontrados)
+
+    pts_esp = np.float32([[marcadores_esperados[k] for k in encontrados]])
+    pts_real = np.float32([[marcadores_reais[k] for k in encontrados]])
+
+    if n >= 3:
+        # Afim completa — exata com 3 pontos, mínimos quadrados com mais
+        M, _ = cv2.estimateAffine2D(pts_esp, pts_real)
+        metodo = "afim"
+    elif n == 2:
+        # Similaridade — rotação + escala uniforme + translação (sem shear)
+        M, _ = cv2.estimateAffinePartial2D(pts_esp, pts_real)
+        metodo = "similaridade"
+    else:
+        # Apenas translação — escala e rotação assumidas como ideais
+        dx = marcadores_reais[encontrados[0]][0] - marcadores_esperados[encontrados[0]][0]
+        dy = marcadores_reais[encontrados[0]][1] - marcadores_esperados[encontrados[0]][1]
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        metodo = "translação"
+
+    resultado = dict(marcadores_reais)
+    for nome in faltantes:
+        px_esp, py_esp = marcadores_esperados[nome]
+        ponto_est = cv2.transform(np.float32([[[px_esp, py_esp]]]), M)[0][0]
+        cx_est, cy_est = float(ponto_est[0]), float(ponto_est[1])
+        resultado[nome] = (cx_est, cy_est)
+
+        if debug:
+            print(
+                f"  RECUPERAÇÃO [{metodo}]: '{nome}' não detectado — "
+                f"estimado em ({cx_est:.0f}, {cy_est:.0f}) px"
+            )
+
+    return resultado
+
+
 def alinhar_imagem(img: np.ndarray, marcadores_reais: dict, marcadores_esperados: dict) -> np.ndarray:
     """
     Aplica homografia pra alinhar a imagem escaneada.
@@ -198,8 +305,8 @@ def processar(img: np.ndarray, config: dict, debug: bool = False) -> np.ndarray:
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Encontra marcadores
-    candidatos = encontrar_marcadores(binary)
+    # Encontra marcadores (com fallback progressivo de solidez)
+    candidatos = encontrar_marcadores_com_fallback(binary, debug=debug)
     if debug:
         print(f"Candidatos a marcador: {len(candidatos)}")
         for c in candidatos:
@@ -209,18 +316,24 @@ def processar(img: np.ndarray, config: dict, debug: bool = False) -> np.ndarray:
     h, w = img.shape[:2]
     marcadores_reais = classificar_cantos(candidatos, w, h)
     if debug:
-        print(f"\nMarcadores classificados:")
+        print(f"\nMarcadores detectados: {len(marcadores_reais)}/4")
         for nome, (cx, cy) in marcadores_reais.items():
             print(f"  {nome}: ({cx}, {cy})")
 
     # Posições esperadas do config
     marcadores_esperados = carregar_marcadores_esperados(config)
+
+    # Se algum marcador não foi detectado, estima a posição via transformação afim
+    if len(marcadores_reais) < 4:
+        marcadores_reais = completar_marcadores_faltantes(
+            marcadores_reais, marcadores_esperados, debug=True
+        )
+
     if debug:
         print(f"\nMarcadores esperados (px):")
         for nome, (cx, cy) in marcadores_esperados.items():
             print(f"  {nome}: ({cx:.0f}, {cy:.0f})")
 
-        # Calcula deslocamento
         print(f"\nDeslocamento (real - esperado):")
         for nome in marcadores_reais:
             rx, ry = marcadores_reais[nome]
@@ -347,8 +460,8 @@ if __name__ == "__main__":
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Encontra e classifica
-    candidatos = encontrar_marcadores(binary)
+    # Encontra e classifica (com fallback progressivo de solidez)
+    candidatos = encontrar_marcadores_com_fallback(binary, debug=True)
     h, w = img.shape[:2]
     marcadores_reais = classificar_cantos(candidatos, w, h)
     marcadores_esperados = carregar_marcadores_esperados(config)

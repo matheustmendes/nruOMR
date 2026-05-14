@@ -1,0 +1,9 @@
+flask
+opencv-python
+numpy
+pyyaml
+openpyxl
+pdf2image
+reportlab
+scikit-image
+pytest

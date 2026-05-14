@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.pdf
+*.xlsx
+*.png
+correcoes.json
+debug_*.png
+presencas_*.xlsx

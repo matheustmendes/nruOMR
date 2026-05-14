@@ -1,0 +1,304 @@
+"""
+ler_bolhas.py
+
+Lê os círculos de presença da imagem alinhada usando as posições
+do config.yaml. Retorna uma lista de resultados por aluno.
+
+Uso standalone (debug):
+    python ler_bolhas.py <scan.pdf ou scan.png> <config.yaml> [pagina_pdf] [pagina_lista]
+"""
+
+import sys
+import cv2
+import numpy as np
+import yaml
+
+# Defaults globais — sobrescritos por scan.offset_y / scan.threshold no config.yaml
+OFFSET_Y = -3
+THRESHOLD = 0.40
+
+
+def _get_offset_y(config: dict) -> float:
+    return config.get("scan", {}).get("offset_y", OFFSET_Y)
+
+
+def _get_threshold(config: dict) -> float:
+    return config.get("scan", {}).get("threshold", THRESHOLD)
+
+
+def mm_para_px(valor_mm: float, dpi: int = 200) -> float:
+    """Converte milímetros para pixels dado um DPI."""
+    return (valor_mm / 25.4) * dpi
+
+
+def carregar_posicoes(config: dict) -> dict:
+    """
+    Extrai do config.yaml as posições de todos os círculos em pixels.
+
+    Returns:
+        dict com:
+            - dias: lista de nomes dos dias
+            - circulos_x: dict[dia] -> (almoco_px, janta_px)
+            - primeira_linha_y_px: Y do primeiro aluno
+            - linha_altura_px: distância vertical entre alunos
+            - raio_px: raio do círculo em pixels
+            - alunos_por_pagina: quantos alunos por página
+    """
+    dpi = config["scan"]["dpi"]
+    layout = config["layout"]
+    circulos = config["circulos"]
+
+    dias = layout["dias"]
+
+    circulos_x = {}
+    for dia, pos in layout["circulos_por_dia"].items():
+        circulos_x[dia] = (
+            mm_para_px(pos["almoco_x"], dpi),
+            mm_para_px(pos["janta_x"], dpi),
+        )
+
+    return {
+        "dias": dias,
+        "circulos_x": circulos_x,
+        "primeira_linha_y_px": mm_para_px(layout["primeira_linha_y_mm"], dpi),
+        "linha_altura_px": mm_para_px(layout["linha_altura_mm"], dpi),
+        "raio_px": mm_para_px(circulos["raio_mm"], dpi),
+        "alunos_por_pagina": layout["alunos_por_pagina"],
+    }
+
+
+def ler_circulo(binary: np.ndarray, cx: float, cy: float, raio_px: float) -> float:
+    """
+    Analisa um único círculo e retorna a proporção de marcação.
+
+    Na imagem BINARY_INV:
+      - pixels 255 (branco) = tinta/marcação
+      - pixels 0 (preto) = fundo
+
+    Args:
+        binary: imagem binarizada (BINARY_INV)
+        cx, cy: centro do círculo em pixels
+        raio_px: raio do círculo em pixels
+
+    Returns:
+        float entre 0 e 1 — proporção de pixels marcados
+    """
+    h, w = binary.shape[:2]
+
+    # Recorta ROI quadrada ao redor do centro
+    x1 = max(0, int(cx - raio_px))
+    y1 = max(0, int(cy - raio_px))
+    x2 = min(w, int(cx + raio_px))
+    y2 = min(h, int(cy + raio_px))
+
+    roi = binary[y1:y2, x1:x2]
+
+    total = roi.size
+    if total == 0:
+        return 0.0
+
+    marcados = np.count_nonzero(roi)  # pixels == 255
+    return marcados / total
+
+
+def ler_pagina(binary: np.ndarray, config: dict, num_alunos: int,
+               threshold: float = None) -> list:
+    """
+    Lê todas as bolhas de uma página.
+
+    Args:
+        binary: imagem binarizada e alinhada (BINARY_INV)
+        config: dict do config.yaml
+        num_alunos: quantos alunos tem nessa página
+        threshold: proporção mínima pra considerar marcado
+
+    Returns:
+        Lista de dicts, um por aluno:
+        {
+            "numero": 1,
+            "dias": {
+                "Segunda": {"almoco": True, "janta": False, "almoco_pct": 0.72, "janta_pct": 0.08},
+                ...
+            }
+        }
+    """
+    pos = carregar_posicoes(config)
+    if threshold is None:
+        threshold = _get_threshold(config)
+    offset_y = _get_offset_y(config)
+    resultados = []
+
+    for i in range(num_alunos):
+        cy = pos["primeira_linha_y_px"] + offset_y + i * pos["linha_altura_px"]
+
+        aluno = {
+            "numero": i + 1,
+            "dias": {},
+        }
+
+        for dia in pos["dias"]:
+            ax, jx = pos["circulos_x"][dia]
+
+            almoco_pct = ler_circulo(binary, ax, cy, pos["raio_px"])
+            janta_pct = ler_circulo(binary, jx, cy, pos["raio_px"])
+
+            aluno["dias"][dia] = {
+                "almoco": almoco_pct >= threshold,
+                "janta": janta_pct >= threshold,
+                "almoco_pct": round(almoco_pct, 3),
+                "janta_pct": round(janta_pct, 3),
+            }
+
+        resultados.append(aluno)
+
+    return resultados
+
+
+def imprimir_resultados(resultados: list, dias: list):
+    """Imprime os resultados em formato legível."""
+    # Cabeçalho
+    header = f"{'Nº':>3} |"
+    for dia in dias:
+        header += f" {dia[:3]:>3} A | {dia[:3]:>3} J |"
+    print(header)
+    print("-" * len(header))
+
+    for aluno in resultados:
+        linha = f"{aluno['numero']:>3} |"
+        for dia in dias:
+            d = aluno["dias"][dia]
+            a = "●" if d["almoco"] else "○"
+            j = "●" if d["janta"] else "○"
+            linha += f"  {a} {d['almoco_pct']:.0%} |  {j} {d['janta_pct']:.0%} |"
+        print(linha)
+
+
+# --- DEBUG VISUAL ---
+
+# def debug_visual(img, binary, config, resultados):
+#     """
+#     Abre no navegador a imagem com os círculos destacados:
+#     - Verde = detectado como marcado
+#     - Vermelho = detectado como vazio
+#     - Amarelo = ambíguo (perto do threshold)
+#     """
+#     import base64
+#     import webbrowser
+#     import tempfile
+
+#     pos = carregar_posicoes(config)
+#     vis = img.copy()
+
+#     threshold = THRESHOLD
+#     margem = 0.05 # zona ambígua
+
+#     for aluno in resultados:
+#         i = aluno["numero"] - 1
+#         cy = int(pos["primeira_linha_y_px"] + OFFSET_Y + i * pos["linha_altura_px"])
+#         raio = int(pos["raio_px"])
+
+#         for dia in pos["dias"]:
+#             ax, jx = pos["circulos_x"][dia]
+
+#             for cx_float, tipo in [(ax, "almoco"), (jx, "janta")]:
+#                 cx = int(cx_float)
+#                 pct = aluno["dias"][dia][f"{tipo}_pct"]
+#                 marcado = aluno["dias"][dia][tipo]
+
+#                 # Cor baseada na confiança
+#                 # +margem
+#                 if pct > threshold + margem:
+              
+#                     cor = (0, 200, 0)      # verde — claramente marcado
+#                     # -margem
+#                 elif pct < threshold - margem:
+#                     cor = (180, 180, 180)   # cinza — claramente vazio
+#                 else:
+#                     cor = (0, 200, 255)     # amarelo — ambíguo
+
+#                 cv2.circle(vis, (cx, cy), raio + 3, cor, 2)
+
+#                 # Mostra a porcentagem dentro do círculo
+#                 texto = f"{pct:.0%}"
+#                 cv2.putText(vis, texto, (cx - 12, cy + 4),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.3, cor, 1)
+
+#     # Gera HTML
+#     _, buffer = cv2.imencode(".png", vis)
+#     b64 = base64.b64encode(buffer).decode("utf-8")
+
+#     html = f"""<!DOCTYPE html>
+#     <html>
+#     <head>
+#         <style>
+#             body {{ font-family: sans-serif; padding: 2rem; background: #f5f5f5; }}
+#             .legenda {{ display: flex; gap: 2rem; margin-bottom: 1rem; font-size: 14px; }}
+#             .legenda span {{ display: flex; align-items: center; gap: 6px; }}
+#             .dot {{ width: 14px; height: 14px; border-radius: 50%; display: inline-block; }}
+#         </style>
+#     </head>
+#     <body>
+#         <h2 style="font-family: monospace;">Leitura das bolhas</h2>
+#         <div class="legenda">
+#             <span><span class="dot" style="background: #00c800;"></span> Marcado</span>
+#             <span><span class="dot" style="background: #b4b4b4;"></span> Vazio</span>
+#             <span><span class="dot" style="background: #00c8ff;"></span> Ambíguo</span>
+#         </div>
+#         <img src="data:image/png;base64,{b64}" style="max-width: 100%; border: 1px solid #ccc;">
+#     </body>
+#     </html>"""
+
+#     with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
+#         f.write(html)
+#         webbrowser.open(f"file://{f.name}")
+
+
+# --- EXECUÇÃO STANDALONE ---
+
+if __name__ == "__main__":
+    from localizar_marcadores import carregar_imagem, processar
+
+    if len(sys.argv) < 3:
+        print("Uso: python ler_bolhas.py <scan.pdf ou scan.png> <config.yaml> [pagina_pdf] [pagina_lista]")
+        print()
+        print("  pagina_pdf:   página do PDF (0 = primeira, default: 0)")
+        print("  pagina_lista: página da lista (1 = primeira, default: 1)")
+        print()
+        print("Exemplos:")
+        print("  python ler_bolhas.py scan.pdf config_canela.yaml")
+        print("  python ler_bolhas.py scan.pdf config_canela.yaml 1      # pula verso branco do duplex")
+        print("  python ler_bolhas.py scan.pdf config_canela.yaml 1 1    # página 1 da lista")
+        sys.exit(1)
+
+    caminho_scan = sys.argv[1]
+    caminho_config = sys.argv[2]
+    pagina_pdf = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    pagina_lista = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+
+    # Carrega config
+    with open(caminho_config, "r") as f:
+        config = yaml.safe_load(f)
+
+    # Carrega e alinha a imagem
+    img = carregar_imagem(caminho_scan, pagina_pdf)
+    alinhada = processar(img, config)
+
+    # Binariza a imagem alinhada
+    gray = cv2.cvtColor(alinhada, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Quantos alunos nessa página
+    alunos_por_pagina = config["layout"]["alunos_por_pagina"]
+
+    # Lê as bolhas
+    resultados = ler_pagina(binary, config, alunos_por_pagina)
+
+    # Imprime resultados
+    dias = config["layout"]["dias"]
+    print(f"\n=== Página {pagina_lista} da lista ===\n")
+    imprimir_resultados(resultados, dias)
+
+    # Debug visual
+    # debug_visual(alinhada, binary, config, resultados)
+    # print("\nDebug visual aberto no navegador.")

@@ -1,0 +1,54 @@
+pagina:
+  largura_mm: 210.0
+  altura_mm: 297.0
+  orientacao: portrait
+scan:
+  dpi: 200
+  offset_y: -3
+  threshold: 0.40
+marcadores:
+  tamanho_mm: 5.0
+  margem_mm: 15.0
+  posicoes:
+    superior_esquerdo:
+      x: 15.0
+      y: 15.0
+    superior_direito:
+      x: 190.0
+      y: 15.0
+    inferior_esquerdo:
+      x: 15.0
+      y: 277.0
+    inferior_direito:
+      x: 190.0
+      y: 277.0
+circulos:
+  raio_mm: 2.5
+  borda_pt: 1.5
+layout:
+  alunos_por_pagina: 25
+  linha_altura_mm: 8.0
+  primeira_linha_y_mm: 62.8
+  dias:
+  - Segunda
+  - Terça
+  - Quarta
+  - Quinta
+  - Sexta
+  circulos_por_dia:
+    Segunda:
+      almoco_x: 105.0
+      janta_x: 113.0
+    Terça:
+      almoco_x: 122.0
+      janta_x: 130.0
+    Quarta:
+      almoco_x: 139.0
+      janta_x: 147.0
+    Quinta:
+      almoco_x: 156.0
+      janta_x: 164.0
+    Sexta:
+      almoco_x: 173.0
+      janta_x: 181.0
+restaurante: CANELA

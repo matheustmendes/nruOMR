@@ -1,0 +1,58 @@
+pagina:
+  largura_mm: 210.0
+  altura_mm: 297.0
+  orientacao: portrait
+scan:
+  dpi: 200
+  offset_y: -3
+  threshold: 0.40
+marcadores:
+  tamanho_mm: 5.0
+  margem_mm: 15.0
+  posicoes:
+    superior_esquerdo:
+      x: 15.0
+      y: 15.0
+    superior_direito:
+      x: 190.0
+      y: 15.0
+    inferior_esquerdo:
+      x: 15.0
+      y: 277.0
+    inferior_direito:
+      x: 190.0
+      y: 277.0
+circulos:
+  raio_mm: 2.5
+  borda_pt: 1.5
+layout:
+  alunos_por_pagina: 25
+  linha_altura_mm: 8.0
+  primeira_linha_y_mm: 62.8
+  dias:
+  - Segunda
+  - Terça
+  - Quarta
+  - Quinta
+  - Sexta
+  - Sábado
+  circulos_por_dia:
+    Segunda:
+      almoco_x: 94.5
+      janta_x: 102.5
+    Terça:
+      almoco_x: 111.5
+      janta_x: 119.5
+    Quarta:
+      almoco_x: 128.5
+      janta_x: 136.5
+    Quinta:
+      almoco_x: 145.5
+      janta_x: 153.5
+    Sexta:
+      almoco_x: 162.5
+      janta_x: 170.5
+    Sábado:
+      almoco_x: 179.5
+      janta_x: 187.5
+restaurante: ONDINA

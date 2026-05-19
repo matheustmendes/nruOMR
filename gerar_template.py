@@ -100,23 +100,22 @@ def ler_planilha(caminho_xlsx: str, nome_aba: str) -> dict:
 
 def abreviar_nome(nome: str, largura_max_pt: float, fonte: str, tamanho: float) -> str:
     """
-    Abrevia sobrenomes do final para o início até o nome caber na largura disponível.
+    Abrevia sobrenomes intermediários até o nome caber na largura disponível.
 
     Estratégia:
         1. Se o nome já cabe, retorna sem alteração.
-        2. Caso contrário, substitui sobrenomes (do último para o primeiro)
-           pela inicial seguida de ponto: "Silva" → "S."
-        3. Preserva sempre o primeiro nome e o segundo nome inteiros.
-           Só abrevia a partir do terceiro token em diante (de trás pra frente).
+        2. Preserva sempre: primeiro nome, penúltimo sobrenome e último sobrenome.
+        3. Abrevia os tokens do meio (da direita para a esquerda) pela inicial
+           seguida de ponto: "Silva" → "S."
         4. Se mesmo abreviando tudo ainda não couber, trunca com "…".
 
     Exemplos:
         "Paulo Matheus Silva Santos Marques"
-            → "Paulo Matheus S. S. M."  (se necessário)
+            → "Paulo M. S. Santos Marques"  (se necessário)
         "Ana Beatriz"
             → "Ana Beatriz"  (não precisa abreviar)
-        "Ana Beatriz Carvalho"
-            → "Ana Beatriz C."  (se necessário)
+        "Ana Beatriz Santos Carvalho"
+            → "Ana B. Santos Carvalho"  (se necessário)
     """
     # Já cabe? Retorna sem alterar.
     if stringWidth(nome, fonte, tamanho) <= largura_max_pt:
@@ -124,14 +123,14 @@ def abreviar_nome(nome: str, largura_max_pt: float, fonte: str, tamanho: float) 
 
     partes = nome.split()
 
-    # Menos de 3 partes: não tem o que abreviar, trunca se necessário.
-    if len(partes) < 3:
+    # Menos de 4 partes: nada para abreviar (primeiro, penúltimo e último já cobrem tudo).
+    if len(partes) < 4:
         return _truncar(nome, largura_max_pt, fonte, tamanho)
 
-    # Abrevia do último sobrenome em direção ao terceiro token
-    # (preserva partes[0] e partes[1] sempre inteiros)
+    # Abrevia tokens intermediários (índices 1 até len-3), do mais à direita ao mais à esquerda.
+    # Preserva partes[0] (primeiro nome), partes[-2] (penúltimo) e partes[-1] (último).
     abreviadas = partes[:]
-    for i in range(len(partes) - 1, 1, -1):
+    for i in range(len(partes) - 3, 0, -1):
         abreviadas[i] = partes[i][0].upper() + "."
         candidato = " ".join(abreviadas)
         if stringWidth(candidato, fonte, tamanho) <= largura_max_pt:

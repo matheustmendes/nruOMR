@@ -38,6 +38,7 @@ from revisar import extrair_recortes, gerar_html_revisao
 from gerar_template import (
     ler_planilha, gerar_template, gerar_config, CONFIG_ABAS
 )
+from google_sheets import exportar_para_sheets
 
 
 app = Flask(__name__)
@@ -59,6 +60,16 @@ RESTAURANTES = {
         "nome": "São Lázaro",
         "aba": "SÃO LÁZARO IMPRESSÃO",
         "config": "config_sao_lazaro.yaml",
+    },
+    "canela_fds": {
+        "nome": "Canela FDS",
+        "aba": " PDCA FDS",
+        "config": "config_canela_fds.yaml",
+    },
+    "sao_lazaro_fds": {
+        "nome": "São Lázaro FDS",
+        "aba": "PDSL FDS",
+        "config": "config_sao_lazaro_fds.yaml",
     },
 }
 
@@ -114,6 +125,10 @@ def rota_processar():
 
         pagina_inicio = int(request.form.get("pagina_inicio", 1) or 1)
 
+        periodo_semana = request.form.get("periodo_semana", "").strip()
+        if not periodo_semana:
+            return jsonify({"erro": "Informe o período da semana (ex: 05/05 a 09/05)"}), 400
+
         # Limpa scan anterior se houver
         old_scan = app.config.get("ULTIMO_SCAN")
         if old_scan and os.path.exists(old_scan):
@@ -166,6 +181,19 @@ def rota_processar():
         except Exception:
             pass
 
+        # Exporta para Google Sheets (não bloqueia em caso de falha)
+        resultado_sheets = exportar_para_sheets(
+            contagem, alunos, dias, restaurante_key, periodo_semana
+        )
+        app.config["ULTIMO_PERIODO"] = periodo_semana
+
+        if resultado_sheets.get("ok"):
+            sheets_resp = {"sheets_status": "ok", "sheets_aba": resultado_sheets.get("aba", "")}
+        elif resultado_sheets.get("duplicado"):
+            sheets_resp = {"sheets_status": "duplicado", "sheets_aba": resultado_sheets.get("aba", "")}
+        else:
+            sheets_resp = {"sheets_status": "erro", "sheets_erro": resultado_sheets.get("erro", "")}
+
         # Guarda caminho pra download e dados de preview
         app.config["ULTIMO_RESULTADO"] = saida_tmp.name
         app.config["ULTIMO_NOME"] = f"presencas_{restaurante_key}.xlsx"
@@ -190,6 +218,7 @@ def rota_processar():
             "ambiguos": ambiguos,
             "paginas": len(paginas),
             "paginas_validas": len(paginas_validas),
+            **sheets_resp,
         })
 
     except Exception as e:
@@ -202,6 +231,7 @@ def rota_gerar_template():
     try:
         restaurante_key = request.form.get("restaurante")
         alunos_file = request.files.get("alunos")
+        data_periodo = request.form.get("data_periodo", "").strip()
 
         if not alunos_file:
             return jsonify({"erro": "Envie a planilha de alunos"}), 400
@@ -224,6 +254,10 @@ def rota_gerar_template():
             rest = RESTAURANTES[key]
             try:
                 info = ler_planilha(alunos_tmp.name, rest["aba"])
+                if not info["restaurante"]:
+                    info["restaurante"] = rest["nome"]
+                if data_periodo:
+                    info["datas"] = data_periodo
 
                 if rest["aba"] in CONFIG_ABAS:
                     dias = CONFIG_ABAS[rest["aba"]]
@@ -325,6 +359,31 @@ def rota_aplicar_correcoes():
         app.config["ULTIMO_RESULTADO"] = saida_tmp.name
         app.config["ULTIMO_NOME"] = f"presencas_{dados['restaurante_key']}.xlsx"
         return jsonify({"sucesso": True})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/sheets_exportar", methods=["POST"])
+def rota_sheets_exportar():
+    dados = app.config.get("REVISAO_DATA")
+    periodo = app.config.get("ULTIMO_PERIODO")
+
+    if not dados or not periodo:
+        return jsonify({"erro": "Nenhum scan em memória. Processe novamente."}), 400
+
+    try:
+        contagem = contar_presencas(dados["resultados"], dados["dias"])
+        resultado = exportar_para_sheets(
+            contagem, dados["alunos"], dados["dias"],
+            dados["restaurante_key"], periodo, forcar=True,
+        )
+
+        if resultado.get("ok"):
+            return jsonify({"sucesso": True, "aba": resultado.get("aba", "")})
+        else:
+            return jsonify({"erro": resultado.get("erro", "Erro desconhecido")}), 500
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"erro": str(e)}), 500
@@ -590,6 +649,24 @@ body {
 }
 .btn-revisar:hover { background: #fef3c7; }
 
+.btn-substituir {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #e9d5ff;
+    background: #faf5ff;
+    color: #7c3aed;
+    font-size: 13px;
+    font-weight: 500;
+    text-align: center;
+    cursor: pointer;
+    font-family: inherit;
+    margin-top: 8px;
+}
+.btn-substituir:hover { background: #f3e8ff; }
+.btn-substituir:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .error-msg {
     margin-top: 1rem;
     padding: 1rem;
@@ -718,6 +795,12 @@ body {
                         <input type="radio" name="rest-template" value="sao_lazaro"> São Lázaro
                     </label>
                     <label class="radio" onclick="selectRadio(this, 'rest-template')">
+                        <input type="radio" name="rest-template" value="canela_fds"> Canela FDS
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-template')">
+                        <input type="radio" name="rest-template" value="sao_lazaro_fds"> S. Lázaro FDS
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-template')">
                         <input type="radio" name="rest-template" value="todos"> Todos
                     </label>
                 </div>
@@ -738,6 +821,12 @@ body {
                     <div class="file-name" id="file-template-name"></div>
                     <div class="file-remove" onclick="removeFile('template')">remover</div>
                 </div>
+            </div>
+
+            <div class="section">
+                <div class="label">Data do período <span style="font-weight:400;color:#aaa">(opcional — ex: 10/05 ou 05/05 a 09/05)</span></div>
+                <input type="text" name="data_periodo" placeholder="10/05"
+                       style="width:200px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
             </div>
 
             <button type="submit" class="btn" id="btn-template">Gerar template</button>
@@ -767,6 +856,12 @@ body {
                     </label>
                     <label class="radio" onclick="selectRadio(this, 'rest-processar')">
                         <input type="radio" name="rest-processar" value="sao_lazaro"> São Lázaro
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                        <input type="radio" name="rest-processar" value="canela_fds"> Canela FDS
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                        <input type="radio" name="rest-processar" value="sao_lazaro_fds"> S. Lázaro FDS
                     </label>
                 </div>
             </div>
@@ -811,6 +906,12 @@ body {
                        style="width:80px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
             </div>
 
+            <div class="section">
+                <div class="label">Período da semana <span style="font-weight:400;color:#aaa">(ex: 05/05 a 09/05)</span></div>
+                <input type="text" name="periodo_semana" placeholder="05/05 a 09/05"
+                       style="width:200px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
+            </div>
+
             <button type="submit" class="btn" id="btn-processar">Processar presenças</button>
         </form>
 
@@ -834,6 +935,10 @@ body {
                 <span class="result-label">Casos ambíguos</span>
                 <span class="result-value" id="r-ambiguos"></span>
             </div>
+            <div class="result-row" id="sheets-row" style="display:none;">
+                <span class="result-label">Google Sheets</span>
+                <span class="result-value" id="sheets-msg"></span>
+            </div>
             <a href="/download" class="btn-download" id="btn-download-proc">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v12m0 0l4-4m-4 4l-4-4M4 18h16"/></svg>
                 <span id="download-nome">Baixar planilha</span>
@@ -841,6 +946,9 @@ body {
             <a href="/revisar_ambiguos" target="_blank" class="btn-revisar" id="btn-revisar" style="display:none;">
                 Revisar casos ambíguos →
             </a>
+            <button type="button" onclick="substituirSemana()" class="btn-substituir" id="btn-substituir" style="display:none;">
+                Substituir semana no Google Sheets
+            </button>
         </div>
 
         <div class="preview-section" id="preview-section" style="display:none;">
@@ -959,13 +1067,16 @@ function submitProcessar(e) {
 
     var scan = form.querySelector('input[name="scan"]');
     var alunos = form.querySelector('input[name="alunos"]');
+    var periodo = form.querySelector('input[name="periodo_semana"]').value.trim();
 
     if (!scan.files.length) { showError('processar', 'Selecione o PDF do scan.'); return false; }
     if (!alunos.files.length) { showError('processar', 'Selecione a planilha de alunos.'); return false; }
+    if (!periodo) { showError('processar', 'Informe o período da semana (ex: 05/05 a 09/05).'); return false; }
 
     data.set('scan', scan.files[0]);
     data.set('alunos', alunos.files[0]);
     data.set('pagina_inicio', form.querySelector('input[name="pagina_inicio"]').value || '1');
+    data.set('periodo_semana', periodo);
 
     showLoading('processar', true);
     hideError('processar');
@@ -997,6 +1108,30 @@ function submitProcessar(e) {
 
             document.getElementById('download-nome').textContent = 'Baixar planilha';
             document.getElementById('result-processar').classList.add('show');
+
+            var sheetsRow = document.getElementById('sheets-row');
+            var sheetsMsg = document.getElementById('sheets-msg');
+            var btnSubst = document.getElementById('btn-substituir');
+            btnSubst.style.display = 'none';
+
+            if (data.sheets_status === 'ok') {
+                sheetsRow.style.display = '';
+                sheetsMsg.textContent = '✓ Exportado (' + data.sheets_aba + ')';
+                sheetsMsg.className = 'result-value result-ok';
+            } else if (data.sheets_status === 'duplicado') {
+                sheetsRow.style.display = '';
+                sheetsMsg.textContent = 'Semana já existe em ' + data.sheets_aba;
+                sheetsMsg.className = 'result-value result-warn';
+                btnSubst.style.display = '';
+                btnSubst.disabled = false;
+                btnSubst.textContent = 'Substituir semana no Google Sheets';
+            } else if (data.sheets_status === 'erro') {
+                sheetsRow.style.display = '';
+                sheetsMsg.textContent = 'Erro no Sheets: ' + (data.sheets_erro || 'falha desconhecida');
+                sheetsMsg.className = 'result-value result-warn';
+            } else {
+                sheetsRow.style.display = 'none';
+            }
 
             var npag = data.paginas_validas || 0;
             if (npag > 0) {
@@ -1062,6 +1197,30 @@ function loadPreview(idx) {
         img.style.opacity = '';
     };
     newImg.src = '/preview/' + idx + '?t=' + ts;
+}
+
+function substituirSemana() {
+    var btn = document.getElementById('btn-substituir');
+    btn.disabled = true;
+    btn.textContent = 'Substituindo...';
+
+    fetch('/sheets_exportar', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var msg = document.getElementById('sheets-msg');
+            btn.style.display = 'none';
+            if (data.erro) {
+                msg.textContent = 'Erro no Sheets: ' + data.erro;
+                msg.className = 'result-value result-warn';
+            } else {
+                msg.textContent = '✓ Exportado (' + (data.aba || '') + ')';
+                msg.className = 'result-value result-ok';
+            }
+        })
+        .catch(function() {
+            btn.disabled = false;
+            btn.textContent = 'Substituir semana no Google Sheets';
+        });
 }
 
 // Drag and drop

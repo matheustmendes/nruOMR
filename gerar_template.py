@@ -1,3 +1,4 @@
+import re
 import sys
 import yaml
 from openpyxl import load_workbook
@@ -48,21 +49,51 @@ def ler_planilha(caminho_xlsx: str, nome_aba: str) -> dict:
 
     ws = wb[nome_aba]
 
-    linhas_cabecalho = []
-    for row in ws.iter_rows(max_row=5, values_only=True):
-        valor = None
+    # Lê as primeiras linhas (até 10) para encontrar informações de cabeçalho
+    cabecalho_vals = []
+    for row in ws.iter_rows(max_row=10, values_only=True):
         for cell in row:
             if cell and str(cell).strip():
-                valor = str(cell).strip()
+                cabecalho_vals.append(str(cell).strip())
                 break
-        linhas_cabecalho.append(valor)
+        else:
+            cabecalho_vals.append(None)
+
+    _MESES = ["JANEIRO", "FEVEREIRO", "MARÇO", "ABRIL", "MAIO", "JUNHO",
+              "JULHO", "AGOSTO", "SETEMBRO", "OUTUBRO", "NOVEMBRO", "DEZEMBRO",
+              "MÊS", "MES"]
 
     restaurante = ""
-    if linhas_cabecalho[2]:
-        restaurante = linhas_cabecalho[2].replace("RELAÇÃO DE BOLSISTAS", "").strip()
+    mes_ano = ""
+    datas = ""
 
-    mes_ano = linhas_cabecalho[3] or ""
-    datas = linhas_cabecalho[4] or ""
+    for val in cabecalho_vals:
+        if not val:
+            continue
+        val_up = val.upper()
+
+        if "RELAÇÃO DE BOLSISTAS" in val_up or "RELACAO DE BOLSISTAS" in val_up:
+            resto = re.sub(r'RELA[ÇC][ÃA]O\s+DE\s+BOLSISTAS\s*', '', val, flags=re.IGNORECASE).strip()
+            if any(m in resto.upper() for m in _MESES):
+                # Resto contém info de mês — salva como mes_ano, restaurante vem do fallback
+                if not mes_ano:
+                    mes_ano = resto
+            else:
+                if not restaurante:
+                    restaurante = resto
+            continue
+
+        if not datas:
+            m = re.search(r'\d{2}/\d{2}\s+[Aa]\s+\d{2}/\d{2}', val)
+            if m:
+                datas = m.group()
+            elif re.search(r'DATA\s*:', val_up):
+                m2 = re.search(r'\d{2}/\d{2}', val)
+                if m2:
+                    datas = m2.group()
+
+        if not mes_ano and any(m in val_up for m in _MESES):
+            mes_ano = val
 
     alunos = []
     for row in ws.iter_rows(min_row=8, values_only=True):

@@ -1,0 +1,30 @@
+# Configuração da integração com Google Sheets
+#
+# Como configurar (fazer uma única vez):
+#
+# 1. Acesse https://console.cloud.google.com e crie um projeto (ou use um existente)
+# 2. Em "APIs e Serviços" → "Biblioteca", ative a "Google Sheets API"
+# 3. Em "APIs e Serviços" → "Credenciais", crie uma "Conta de Serviço"
+# 4. Gere e baixe a chave JSON da conta de serviço
+# 5. Salve o arquivo JSON nesta pasta como "credentials_sheets.json"
+# 6. Para cada planilha abaixo:
+#    - Abra a planilha no Google Sheets
+#    - Clique em "Compartilhar"
+#    - Adicione o e-mail da conta de serviço (está no JSON, campo "client_email")
+#    - Dê permissão de "Editor"
+# 7. O spreadsheet_id está na URL da planilha:
+#    https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
+
+credentials: credentials_sheets.json
+
+restaurantes:
+  canela:
+    spreadsheet_id: "1_2fN2CtcB-i_ii6r8dML8A1qh6lJCq-VRTGB4cW3SQ8"
+  ondina:
+    spreadsheet_id: "1g5t9llFxPEfy9zrP4S4bGYQTolMx-rXfBjwgHpw-068"
+  sao_lazaro:
+    spreadsheet_id: "1FKYsvawHubvFQ8wb0EbJzPrQvuPFLLtbXQRaQ7GVh8Q"
+  canela_fds:
+    spreadsheet_id: ""
+  sao_lazaro_fds:
+    spreadsheet_id: ""

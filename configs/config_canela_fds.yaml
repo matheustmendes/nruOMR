@@ -28,25 +28,9 @@ layout:
   linha_altura_mm: 8.0
   primeira_linha_y_mm: 62.8
   dias:
-  - Segunda
-  - Terça
-  - Quarta
-  - Quinta
-  - Sexta
+  - Sábado
   circulos_por_dia:
-    Segunda:
+    Sábado:
       almoco_x: 105.0
       janta_x: 113.0
-    Terça:
-      almoco_x: 122.0
-      janta_x: 130.0
-    Quarta:
-      almoco_x: 139.0
-      janta_x: 147.0
-    Quinta:
-      almoco_x: 156.0
-      janta_x: 164.0
-    Sexta:
-      almoco_x: 173.0
-      janta_x: 181.0
-restaurante: SÃO LÁZARO
+restaurante: CANELA

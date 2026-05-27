@@ -9,3 +9,9 @@ __pycache__/
 correcoes.json
 debug_*.png
 presencas_*.xlsx
+credentials_sheets.json
+.claude/
+.vscode/
+.ipynb_checkpoints/
+poppler/
+Untitled.ipynb

@@ -7,3 +7,5 @@ pdf2image
 reportlab
 scikit-image
 pytest
+gspread
+google-auth

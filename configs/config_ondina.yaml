@@ -4,8 +4,6 @@ pagina:
   orientacao: portrait
 scan:
   dpi: 200
-  offset_y: -3
-  threshold: 0.40
 marcadores:
   tamanho_mm: 5.0
   margem_mm: 15.0

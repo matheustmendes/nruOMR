@@ -99,21 +99,94 @@ def eh_pagina_branca(img, threshold_pct=2.0):
     return pct < threshold_pct
 
 
+# --- DETECÇÃO DE NÚMERO DE PÁGINA VIA OCR ---
+
+def _detectar_numero_pagina(alinhada: np.ndarray, config: dict):
+    """
+    Lê o número da página do cabeçalho ("Página X de Y") via OCR.
+
+    Usa pytesseract se disponível. A posição do texto é calculada a partir
+    do layout fixo de gerar_template.py (47mm do topo, borda direita a 195mm).
+
+    Retorna int com o número da página, ou None se OCR não estiver disponível
+    ou o texto não foi reconhecido.
+
+    Para ativar: pip install pytesseract
+                 + Tesseract-OCR: https://github.com/UB-Mannheim/tesseract/wiki
+    """
+    try:
+        import pytesseract
+        import re as _re
+    except ImportError:
+        return None
+
+    pytesseract.pytesseract.tesseract_cmd = (
+        r"C:\Users\matheus.torres\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+    )
+
+    dpi = config["scan"]["dpi"]
+
+    def mm_px(mm):
+        return (mm / 25.4) * dpi
+
+    # "Página X de Y" é desenhado em y ≈ 47mm do topo no formulário alinhado.
+    # Derivado de gerar_template.py:
+    #   y = altura - MARCADOR_MARGEM(15) - MARCADOR_TAM(5) - 12mm = 32mm do topo
+    #   y -= 5mm (título "Pró-Reitoria")      → 37mm
+    #   y -= 5mm (título "RELAÇÃO...")         → 42mm
+    #   y -= 5mm (linha de datas)              → 47mm  ← texto aqui
+    y_base = int(mm_px(47))
+    x_dir = int(mm_px(195))  # borda direita do texto (largura - margem = 210-15)
+
+    # Recorta apenas a linha do número de página, com pequena folga
+    y1 = max(0, y_base - int(mm_px(4)))
+    y2 = min(alinhada.shape[0], y_base + int(mm_px(4)))
+    x1 = max(0, x_dir - int(mm_px(75)))  # 75mm de largura a partir da borda direita
+    x2 = min(alinhada.shape[1], x_dir + 5)
+
+    if y2 <= y1 or x2 <= x1:
+        return None
+
+    crop = alinhada[y1:y2, x1:x2]
+    if len(crop.shape) == 3:
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    # Binariza e amplia 3× para melhorar reconhecimento de dígitos pequenos
+    _, crop_bin = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    crop_up = cv2.resize(crop_bin, None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
+
+    try:
+        text = pytesseract.image_to_string(
+            crop_up,
+            config="--psm 7 --oem 3"
+        ).strip()
+    except Exception:
+        return None
+
+    m = _re.search(r"[Pp][aá]gina\s+(\d+)\s+de\b", text, _re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
 # --- PROCESSAMENTO COMPLETO ---
 
-def processar_pdf_completo(paginas, config, pagina_inicio=1, retornar_imagens=False):
+def processar_pdf_completo(paginas, config, retornar_imagens=False):
     """
     Processa todas as páginas do scan:
     1. Pula páginas em branco
     2. Alinha cada página usando marcadores
     3. Lê as bolhas
+    4. Reordena pelo número impresso no formulário (via OCR), se disponível
+
+    A reordenação automática corrige casos em que o scanner embaralha as folhas
+    durante o scan em massa. Se o OCR não estiver disponível (pytesseract não
+    instalado), as páginas são processadas na ordem do scan.
 
     Args:
         paginas: lista de imagens BGR
         config: dict do config.yaml
-        pagina_inicio: número da página do template que a primeira página escaneada
-            representa. Use 1 (padrão) para scans completos. Use 3, por exemplo,
-            se você escaneou apenas a página 3 do formulário.
         retornar_imagens: se True, retorna também (paginas_alinhadas, binarios,
             resultados_por_pagina) para uso no fluxo de revisão.
 
@@ -126,7 +199,7 @@ def processar_pdf_completo(paginas, config, pagina_inicio=1, retornar_imagens=Fa
     paginas_alinhadas_out = []
     binarios_out = []
     resultados_por_pagina_out = []
-    paginas_processadas = 0
+    paginas_brutas = []  # acumula páginas antes de ordenar
     paginas_brancas = 0
     paginas_com_erro = 0
 
@@ -137,11 +210,7 @@ def processar_pdf_completo(paginas, config, pagina_inicio=1, retornar_imagens=Fa
             print(f"  [BRANCA] PDF página {i + 1} — ignorada")
             continue
 
-        paginas_processadas += 1
-        # Página do template correspondente a este scan
-        pagina_template = pagina_inicio + paginas_processadas - 1
-        print(f"  Processando página {paginas_processadas} "
-              f"(PDF pág {i + 1} → template pág {pagina_template})...")
+        print(f"  Processando PDF página {i + 1}...")
 
         try:
             # Alinha
@@ -152,25 +221,24 @@ def processar_pdf_completo(paginas, config, pagina_inicio=1, retornar_imagens=Fa
             blurred = cv2.GaussianBlur(gray, (3, 3), 0)
             _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-            # Lê bolhas
+            # Lê bolhas (numeração local: 1 a alunos_por_pagina)
             resultados = ler_pagina(binary, config, alunos_por_pagina)
 
-            # Ajusta numeração com base na página do template
-            for r in resultados:
-                r["numero"] = (pagina_template - 1) * alunos_por_pagina + r["numero"]
+            # Tenta detectar o número da página via OCR
+            num_detectado = _detectar_numero_pagina(alinhada, config)
 
-            todos_resultados.extend(resultados)
+            paginas_brutas.append({
+                "resultados": resultados,
+                "num_detectado": num_detectado,
+                "alinhada": alinhada,
+                "binary": binary,
+            })
 
-            if retornar_imagens:
-                paginas_alinhadas_out.append(alinhada)
-                binarios_out.append(binary)
-                resultados_por_pagina_out.append(resultados)
-
-            print(f"    ✓ {len(resultados)} alunos lidos")
+            label = f"página {num_detectado}" if num_detectado is not None else "número não detectado"
+            print(f"    ✓ {len(resultados)} alunos lidos ({label})")
 
         except Exception as e:
             paginas_com_erro += 1
-            # Mostra o erro completo pra facilitar diagnóstico
             print(f"    ERRO na página {i + 1}: {e}")
             print("    --- Traceback ---")
             traceback.print_exc()
@@ -178,15 +246,51 @@ def processar_pdf_completo(paginas, config, pagina_inicio=1, retornar_imagens=Fa
             print("    Esta página será ignorada. Verifique se os marcadores estão visíveis no scan.")
             continue
 
+    # Reordenar páginas se todos os números foram detectados com sucesso
+    todos_detectados = bool(paginas_brutas) and all(
+        p["num_detectado"] is not None for p in paginas_brutas
+    )
+
+    if todos_detectados and len(paginas_brutas) > 1:
+        nums_antes = [p["num_detectado"] for p in paginas_brutas]
+        paginas_brutas.sort(key=lambda p: p["num_detectado"])
+        nums_depois = [p["num_detectado"] for p in paginas_brutas]
+        if nums_antes != nums_depois:
+            print(f"\n  Páginas reordenadas: {nums_antes} → {nums_depois}")
+        else:
+            print(f"\n  Ordem já estava correta (páginas: {nums_depois})")
+    elif paginas_brutas:
+        n_det = sum(1 for p in paginas_brutas if p["num_detectado"] is not None)
+        if n_det == 0:
+            print(f"\n  OCR indisponível — usando ordem do scan.")
+            print(f"  Para reordenamento automático: pip install pytesseract + instalar Tesseract-OCR")
+        else:
+            print(f"\n  AVISO: número detectado em {n_det}/{len(paginas_brutas)} páginas — mantendo ordem do scan.")
+
+    # Atribuir numeração global de aluno com base na ordem correta
+    for idx, p in enumerate(paginas_brutas):
+        pagina_template = p["num_detectado"] if todos_detectados else (1 + idx)
+
+        for r in p["resultados"]:
+            r["numero"] = (pagina_template - 1) * alunos_por_pagina + r["numero"]
+
+        todos_resultados.extend(p["resultados"])
+
+        if retornar_imagens:
+            paginas_alinhadas_out.append(p["alinhada"])
+            binarios_out.append(p["binary"])
+            resultados_por_pagina_out.append(p["resultados"])
+
+    n_processadas = len(paginas_brutas)
     print(f"\nResumo:")
-    print(f"  {paginas_processadas} páginas processadas")
+    print(f"  {n_processadas} páginas processadas")
     print(f"  {paginas_brancas} em branco puladas")
     if paginas_com_erro:
         print(f"  {paginas_com_erro} com ERRO (marcadores não detectados?)")
     print(f"  {len(todos_resultados)} alunos lidos no total")
 
     # Se absolutamente nada foi processado, levanta erro claro
-    if paginas_processadas > 0 and not todos_resultados:
+    if n_processadas > 0 and not todos_resultados:
         raise RuntimeError(
             f"Nenhuma página foi processada com sucesso — {paginas_com_erro} página(s) com erro. "
             f"Causa mais provável: marcadores fiduciais não detectados no scan. "
@@ -382,12 +486,10 @@ def main():
         print()
         print("Opções:")
         print("  --merge scan2.pdf ...      Mescla múltiplos PDFs antes de processar")
-        print("  --pagina-inicio N          Página do formulário onde o scan começa (padrão: 1)")
         print("  --correcoes arquivo.json   Aplica correções manuais da revisão")
         print()
         print("Exemplos:")
         print('  python exportar.py scan.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO"')
-        print('  python exportar.py scan3.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --pagina-inicio 3')
         print('  python exportar.py scan1.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --merge scan2.pdf')
         sys.exit(1)
 
@@ -406,13 +508,6 @@ def main():
                 break
             extras.append(arg)
         pdfs.extend(extras)
-
-    # Página do template onde começa o scan
-    pagina_inicio = 1
-    if "--pagina-inicio" in sys.argv:
-        idx = sys.argv.index("--pagina-inicio")
-        pagina_inicio = int(sys.argv[idx + 1])
-        print(f"Página de início: {pagina_inicio}")
 
     # Checa se tem correções
     correcoes = None
@@ -435,7 +530,7 @@ def main():
 
     # Processa
     print("\n=== Processando páginas ===")
-    resultados = processar_pdf_completo(paginas, config, pagina_inicio=pagina_inicio)
+    resultados = processar_pdf_completo(paginas, config)
 
     # Aplica correções se houver
     if correcoes:

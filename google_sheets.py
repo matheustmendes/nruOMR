@@ -129,6 +129,57 @@ def _localizar_bloco(aba, periodo):
     return (inicio, fim)
 
 
+def _localizar_bloco_semana_fds(aba, periodo_fds):
+    """
+    Para FDS: encontra o bloco de dias úteis da mesma semana, mesmo que o
+    período FDS ("10/05 a 10/05") não coincida exatamente com o da semana
+    ("05/05 a 09/05"). Aceita blocos cujo início seja 0-6 dias antes do FDS.
+    """
+    from datetime import datetime
+
+    try:
+        parte = periodo_fds.split(" a ")[0].strip()
+        dd, mm = parte.split("/")
+        hoje = datetime.now()
+        ano = hoje.year if int(mm) <= hoje.month else hoje.year - 1
+        data_fds = datetime(ano, int(mm), int(dd))
+    except Exception:
+        return None
+
+    valores = aba.get_all_values()
+    melhor = None  # (inicio_1idx, diff_dias)
+
+    for i, row in enumerate(valores):
+        if not (row and row[0].startswith("Período: ")):
+            continue
+        periodo_str = row[0][len("Período: "):]
+        try:
+            parte2 = periodo_str.split(" a ")[0].strip()
+            dd2, mm2 = parte2.split("/")
+            # Mesmo ano ou anterior se o mês do bloco for maior que o mês FDS
+            ano2 = ano if int(mm2) <= int(mm) else ano - 1
+            data_ini = datetime(ano2, int(mm2), int(dd2))
+            diff = (data_fds - data_ini).days
+            if 0 <= diff <= 6:
+                if melhor is None or diff < melhor[1]:
+                    melhor = (i + 1, diff)
+        except Exception:
+            continue
+
+    if melhor is None:
+        return None
+
+    inicio_1idx = melhor[0]
+    fim = inicio_1idx
+    for i in range(inicio_1idx, len(valores)):
+        if not any(valores[i]):
+            fim = i + 1
+            break
+        fim = i + 1
+
+    return (inicio_1idx, fim)
+
+
 def _construir_bloco(contagem, alunos, dias, periodo):
     linhas = []
     linhas.append([_marcador_periodo(periodo)])
@@ -299,6 +350,183 @@ def _aplicar_formatacao(spreadsheet, aba, linha_inicio_1idx, num_alunos, num_dia
     spreadsheet.batch_update({"requests": requests})
 
 
+# Restaurantes FDS não têm planilha própria: usam a planilha do restaurante pai
+# e mesclam os dados no bloco da semana já existente.
+# FDS especial = feriado emendado com dias customizáveis (ex: Qui+Sex+Sab).
+_RESTAURANTE_PAI = {
+    "canela_fds":           "canela",
+    "sao_lazaro_fds":       "sao_lazaro",
+    "canela_fds_especial":  "canela",
+    "sao_lazaro_fds_especial": "sao_lazaro",
+}
+
+
+def _mesclar_fds_no_bloco(aba, inicio_1idx, contagem_fds, dias_fds):
+    """
+    Adiciona dados do FDS ao bloco da semana já existente.
+
+    Suporta múltiplos dias (ex: FDS especial = ["Quinta", "Sexta", "Sábado"]).
+    - Dias já presentes no header (mesmo vindos do template de semana) são
+      reutilizados; dias novos são adicionados após a última coluna.
+    - Incrementa "Presenças" com o total de dias FDS presentes por aluno.
+    """
+    import gspread as _gs
+
+    valores = aba.get_all_values()
+
+    # header está no índice 0-based = inicio_1idx (marcador é inicio_1idx - 1)
+    header_0idx = inicio_1idx
+    header_row_1idx = inicio_1idx + 1
+    data_start_0idx = inicio_1idx + 1
+
+    if header_0idx >= len(valores):
+        return
+
+    header = valores[header_0idx]
+
+    # Mapeia cada dia FDS para a coluna no header (existente ou nova)
+    dia_cols = {}   # dia -> col_0idx
+    novos_dias = [] # dias que precisam de nova coluna no cabeçalho
+
+    ultimo_col_alocado = max((j for j, h in enumerate(header) if h.strip()), default=3)
+
+    for dia in dias_fds:
+        col = None
+        for j, h in enumerate(header):
+            if h.strip() == dia:
+                col = j
+                break
+        if col is None:
+            ultimo_col_alocado += 1
+            col = ultimo_col_alocado
+            novos_dias.append(dia)
+        dia_cols[dia] = col
+
+    col_presencas_0idx = 3
+    fds_map = {c["numero"]: c for c in contagem_fds}
+    updates = []
+
+    for dia in novos_dias:
+        updates.append({
+            "range": _gs.utils.rowcol_to_a1(header_row_1idx, dia_cols[dia] + 1),
+            "values": [[dia]],
+        })
+
+    for row_0idx in range(data_start_0idx, len(valores)):
+        row = valores[row_0idx]
+        if not any(cell.strip() for cell in row):
+            break
+
+        try:
+            num = int(row[0])
+        except (ValueError, IndexError):
+            continue
+
+        c = fds_map.get(num)
+        if not c:
+            continue
+
+        sheet_row_1idx = row_0idx + 1
+
+        try:
+            presencas_atuais = (
+                int(row[col_presencas_0idx])
+                if col_presencas_0idx < len(row) and row[col_presencas_0idx].strip()
+                else 0
+            )
+        except ValueError:
+            presencas_atuais = 0
+
+        updates.append({
+            "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, col_presencas_0idx + 1),
+            "values": [[presencas_atuais + c["presencas"]]],
+        })
+
+        for dia in dias_fds:
+            d = c["detalhes"].get(dia, {})
+            marcas = ("A" if d.get("almoco") else "") + ("J" if d.get("janta") else "")
+            updates.append({
+                "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, dia_cols[dia] + 1),
+                "values": [[marcas]],
+            })
+
+    if updates:
+        aba.batch_update(updates, value_input_option="USER_ENTERED")
+
+
+def _desfazer_fds_do_bloco(aba, inicio_1idx, dias_fds):
+    """
+    Desfaz a mesclagem FDS de um bloco (para permitir re-exportação forçada).
+
+    Suporta múltiplos dias: decrementa "Presenças" pelo número de dias FDS que
+    tinham marcação e limpa as células correspondentes.
+    """
+    import gspread as _gs
+
+    valores = aba.get_all_values()
+    header_0idx = inicio_1idx
+    data_start_0idx = inicio_1idx + 1
+
+    if header_0idx >= len(valores):
+        return
+
+    header = valores[header_0idx]
+
+    # Localiza colunas para cada dia FDS
+    dia_cols = {}
+    for dia in dias_fds:
+        for j, h in enumerate(header):
+            if h.strip() == dia:
+                dia_cols[dia] = j
+                break
+
+    if not dia_cols:
+        return
+
+    col_presencas_0idx = 3
+    updates = []
+
+    for row_0idx in range(data_start_0idx, len(valores)):
+        row = valores[row_0idx]
+        if not any(cell.strip() for cell in row):
+            break
+
+        sheet_row_1idx = row_0idx + 1
+
+        # Conta quantos dias FDS tinham marcação nesta linha
+        dias_tinha = sum(
+            1 for col in dia_cols.values()
+            if col < len(row) and row[col].strip()
+        )
+
+        if dias_tinha == 0:
+            continue
+
+        try:
+            presencas_atuais = (
+                int(row[col_presencas_0idx])
+                if col_presencas_0idx < len(row) and row[col_presencas_0idx].strip()
+                else dias_tinha
+            )
+        except ValueError:
+            presencas_atuais = dias_tinha
+
+        updates.append({
+            "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, col_presencas_0idx + 1),
+            "values": [[max(0, presencas_atuais - dias_tinha)]],
+        })
+
+        for col in dia_cols.values():
+            if col < len(row) and row[col].strip():
+                updates.append({
+                    "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, col + 1),
+                    "values": [[""]],
+                })
+
+    if updates:
+        aba.batch_update(updates, value_input_option="USER_ENTERED")
+
+
 def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forcar=False):
     """
     Exporta dados de presença para Google Sheets.
@@ -321,13 +549,17 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
     try:
         config = _carregar_config()
 
-        rest = config.get("restaurantes", {}).get(restaurante_key, {})
+        # FDS usa a planilha do restaurante pai (ex: canela_fds → canela)
+        restaurante_efetivo = _RESTAURANTE_PAI.get(restaurante_key, restaurante_key)
+        eh_fds = restaurante_key in _RESTAURANTE_PAI
+
+        rest = config.get("restaurantes", {}).get(restaurante_efetivo, {})
         spreadsheet_id = rest.get("spreadsheet_id", "").strip()
         if not spreadsheet_id:
             return {
                 "ok": False,
                 "erro": (
-                    f"spreadsheet_id não configurado para '{restaurante_key}' "
+                    f"spreadsheet_id não configurado para '{restaurante_efetivo}' "
                     "em config_sheets.yaml"
                 ),
             }
@@ -339,12 +571,65 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
 
         bloco_existente = _localizar_bloco(aba, periodo)
 
+        if eh_fds:
+            # Tenta localizar o bloco da semana mesmo quando o período FDS difere
+            # (ex: "10/05 a 10/05" vs "05/05 a 09/05")
+            if bloco_existente is None:
+                bloco_existente = _localizar_bloco_semana_fds(aba, periodo)
+
+            if bloco_existente:
+                inicio, fim = bloco_existente
+                valores = aba.get_all_values()
+                header = valores[inicio] if inicio < len(valores) else []
+                dia_fds_set = set(dias)
+
+                # Verifica dados reais nas colunas FDS — não basta o header existir,
+                # pois no FDS especial (ex: Qui+Sex+Sab) Qui/Sex podem estar no
+                # template de semana mas vazios (feriado).
+                ja_mesclado = False
+                for j, h in enumerate(header):
+                    if h.strip() not in dia_fds_set:
+                        continue
+                    for row_0idx in range(inicio + 1, len(valores)):
+                        row = valores[row_0idx]
+                        if not any(cell.strip() for cell in row):
+                            break
+                        if j < len(row) and row[j].strip():
+                            ja_mesclado = True
+                            break
+                    if ja_mesclado:
+                        break
+
+                if ja_mesclado and not forcar:
+                    return {"ok": False, "duplicado": True, "aba": nome_aba}
+
+                if ja_mesclado and forcar:
+                    _desfazer_fds_do_bloco(aba, inicio, dias)
+
+                _mesclar_fds_no_bloco(aba, inicio, contagem, dias)
+            else:
+                # Bloco da semana ainda não existe: cria um bloco FDS standalone
+                bloco = _construir_bloco(contagem, alunos, dias, periodo)
+                linha_inicio = _ultima_linha_com_dados(aba) + 1
+                aba.append_rows(bloco, value_input_option="USER_ENTERED")
+                try:
+                    _aplicar_formatacao(spreadsheet, aba, linha_inicio, len(contagem), len(dias))
+                except Exception as e_fmt:
+                    return {"ok": True, "aba": nome_aba, "aviso_formatacao": str(e_fmt)}
+
+            return {"ok": True, "aba": nome_aba}
+
+        # --- Fluxo normal (restaurante de semana) ---
         if bloco_existente and not forcar:
             return {"ok": False, "duplicado": True, "aba": nome_aba}
 
         if bloco_existente:
             inicio, fim = bloco_existente
-            aba.delete_rows(inicio, fim)
+            total_linhas = len(aba.get_all_values())
+            if inicio == 1 and fim >= total_linhas:
+                aba.clear()
+            else:
+                aba.delete_rows(inicio, fim)
 
         bloco = _construir_bloco(contagem, alunos, dias, periodo)
         linha_inicio = _ultima_linha_com_dados(aba) + 1

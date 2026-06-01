@@ -178,14 +178,6 @@ def processar_scan():
     if not xlsx:
         return
 
-    # Página de início
-    pagina_inicio = 1
-    print(f"\n  Página de início do formulário? (Enter = 1)")
-    print("  Use outro valor se o scan não começa pela primeira página.")
-    pi = input("  Página de início: ").strip()
-    if pi.isdigit() and int(pi) >= 1:
-        pagina_inicio = int(pi)
-
     print("\n  Processando...")
     try:
         from exportar import (
@@ -197,7 +189,7 @@ def processar_scan():
         dpi = config["scan"]["dpi"]
 
         paginas = carregar_todas_paginas(*pdfs, dpi=dpi)
-        resultados = processar_pdf_completo(paginas, config, pagina_inicio=pagina_inicio)
+        resultados = processar_pdf_completo(paginas, config)
 
         alunos = ler_nomes_alunos(xlsx, nome_aba)
         contagem = contar_presencas(resultados, dias)

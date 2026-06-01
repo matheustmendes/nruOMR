@@ -462,7 +462,6 @@ def main():
         config = yaml.safe_load(f)
 
     dias = config["layout"]["dias"]
-    alunos_por_pagina = config["layout"]["alunos_por_pagina"]
 
     if "--merge" in sys.argv:
         idx = sys.argv.index("--merge")
@@ -471,56 +470,14 @@ def main():
                 break
             pdfs.append(arg)
 
-    pagina_inicio = 1
-    if "--pagina-inicio" in sys.argv:
-        idx = sys.argv.index("--pagina-inicio")
-        pagina_inicio = int(sys.argv[idx + 1])
-        print(f"Página de início: {pagina_inicio}")
-
-    # Carrega
+    # Carrega e processa (com reordenamento automático por OCR)
     print("=== Carregando PDFs ===")
     todas_paginas = carregar_todas_paginas(*pdfs, dpi=config["scan"]["dpi"])
 
-    # Separa páginas reais e processa cada uma
     print("\n=== Processando páginas ===")
-    paginas_alinhadas = []
-    binarios = []
-    resultados_por_pagina = []
-    paginas_processadas = 0
-
-    for i, img in enumerate(todas_paginas):
-        if eh_pagina_branca(img):
-            continue
-
-        paginas_processadas += 1
-        pagina_template = pagina_inicio + paginas_processadas - 1
-        print(f"  Processando página {paginas_processadas} (PDF pág {i + 1} → template pág {pagina_template})...")
-
-        try:
-            alinhada = processar(img, config)
-            gray = cv2.cvtColor(alinhada, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-            resultados = ler_pagina(binary, config, alunos_por_pagina)
-
-            # Ajusta numeração global com base na página do template
-            offset = (pagina_template - 1) * alunos_por_pagina
-            for r in resultados:
-                r["numero"] = offset + r["numero"]
-
-            paginas_alinhadas.append(alinhada)
-            binarios.append(binary)
-            resultados_por_pagina.append(resultados)
-
-        except Exception as e:
-            print(f"    ERRO: {e}")
-            continue
-
-    # Junta todos os resultados
-    todos_resultados = []
-    for r in resultados_por_pagina:
-        todos_resultados.extend(r)
+    todos_resultados, paginas_alinhadas, binarios, resultados_por_pagina = processar_pdf_completo(
+        todas_paginas, config, retornar_imagens=True
+    )
 
     # Conta presenças
     contagem = contar_presencas(todos_resultados, dias)

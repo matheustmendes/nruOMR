@@ -4,7 +4,7 @@ Testes unitários para as funções de lógica pura do pipeline.
 Cobertura:
     - contar_presencas
     - aplicar_correcoes
-    - exportar_xlsx  (inclui regressão do bug de pagina_inicio > 1)
+    - exportar_xlsx
     - ler_nomes_alunos
     - eh_pagina_branca
 
@@ -245,11 +245,10 @@ class TestExportarXlsx:
         ws = load_workbook(saida).active
         assert "Aluno 10" in str(ws.cell(2, 2).value)
 
-    def test_regressao_pagina_inicio_2_usa_nome_correto(self, tmp_path):
+    def test_aluno_pagina_2_usa_nome_correto(self, tmp_path):
         """
-        Bug corrigido: ao escanear só a página 2 (pagina_inicio=2), os alunos
-        recebem números 26-50. O xlsx deve associar cada número ao nome correto
-        da planilha (alunos[25] para numero=26), e não ao índice local (alunos[0]).
+        Alunos da página 2 recebem números 26-50. O xlsx deve associar cada
+        número ao nome correto da planilha (alunos[25] para numero=26).
         """
         saida = str(tmp_path / "saida.xlsx")
         # Simula aluno 26 (primeira linha da página 2)

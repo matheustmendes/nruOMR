@@ -71,6 +71,16 @@ RESTAURANTES = {
         "aba": "PDSL FDS",
         "config": "config_sao_lazaro_fds.yaml",
     },
+    "canela_fds_especial": {
+        "nome": "Canela FDS Especial",
+        "aba": " PDCA FDS",
+        "config": "config_canela_fds_especial.yaml",
+    },
+    "sao_lazaro_fds_especial": {
+        "nome": "São Lázaro FDS Especial",
+        "aba": "PDSL FDS",
+        "config": "config_sao_lazaro_fds_especial.yaml",
+    },
 }
 
 
@@ -123,8 +133,6 @@ def rota_processar():
         dias = config["layout"]["dias"]
         restaurante = RESTAURANTES[restaurante_key]
 
-        pagina_inicio = int(request.form.get("pagina_inicio", 1) or 1)
-
         periodo_semana = request.form.get("periodo_semana", "").strip()
         if not periodo_semana:
             return jsonify({"erro": "Informe o período da semana (ex: 05/05 a 09/05)"}), 400
@@ -139,9 +147,8 @@ def rota_processar():
 
         # Processa
         paginas = carregar_todas_paginas(scan_tmp.name, dpi=config["scan"]["dpi"])
-        paginas_validas = [i for i, img in enumerate(paginas) if not eh_pagina_branca(img)]
         resultados, pags_alinhadas, binarios, resultados_por_pag = processar_pdf_completo(
-            paginas, config, pagina_inicio=pagina_inicio, retornar_imagens=True
+            paginas, config, retornar_imagens=True
         )
         alunos = ler_nomes_alunos(alunos_tmp.name, restaurante["aba"])
 
@@ -199,7 +206,6 @@ def rota_processar():
         app.config["ULTIMO_NOME"] = f"presencas_{restaurante_key}.xlsx"
         app.config["ULTIMO_SCAN"] = scan_tmp.name
         app.config["ULTIMO_CONFIG"] = config
-        app.config["PAGINAS_VALIDAS"] = paginas_validas
         app.config["REVISAO_DATA"] = {
             "paginas_alinhadas": pags_alinhadas,
             "binarios": binarios,
@@ -217,7 +223,7 @@ def rota_processar():
             "com_presenca": com_presenca,
             "ambiguos": ambiguos,
             "paginas": len(paginas),
-            "paginas_validas": len(paginas_validas),
+            "paginas_validas": len(pags_alinhadas),
             **sheets_resp,
         })
 
@@ -259,7 +265,16 @@ def rota_gerar_template():
                 if data_periodo:
                     info["datas"] = data_periodo
 
-                if rest["aba"] in CONFIG_ABAS:
+                if key in ("canela_fds_especial", "sao_lazaro_fds_especial"):
+                    dias_str = request.form.get("dias_especial", "")
+                    dias = [d.strip() for d in dias_str.split(",") if d.strip()]
+                    if not dias:
+                        resultados_geracao.append({
+                            "restaurante": rest["nome"],
+                            "erro": "Selecione ao menos um dia para o FDS especial.",
+                        })
+                        continue
+                elif rest["aba"] in CONFIG_ABAS:
                     dias = CONFIG_ABAS[rest["aba"]]
                 else:
                     dias = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"]
@@ -409,30 +424,23 @@ def rota_download_template(restaurante):
 
 @app.route("/preview/<int:idx>")
 def rota_preview(idx):
-    scan_path = app.config.get("ULTIMO_SCAN")
+    dados = app.config.get("REVISAO_DATA")
     config = app.config.get("ULTIMO_CONFIG")
-    paginas_validas = app.config.get("PAGINAS_VALIDAS", [])
 
-    if not scan_path or not os.path.exists(scan_path) or not config:
+    if not dados or not config:
         return "Sem dados de preview", 404
 
-    if idx < 0 or idx >= len(paginas_validas):
+    paginas_alinhadas = dados.get("paginas_alinhadas", [])
+    binarios = dados.get("binarios", [])
+    resultados_por_pagina = dados.get("resultados_por_pagina", [])
+
+    if idx < 0 or idx >= len(paginas_alinhadas):
         return "Página inválida", 404
 
-    pdf_page_idx = paginas_validas[idx]
-
     try:
-        paginas = carregar_todas_paginas(scan_path, dpi=config["scan"]["dpi"])
-        img = paginas[pdf_page_idx]
-
-        alinhada = processar(img, config)
-
-        gray = cv2.cvtColor(alinhada, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        alunos_por_pagina = config["layout"]["alunos_por_pagina"]
-        resultados = ler_pagina(binary, config, alunos_por_pagina)
+        # Usa os dados já processados e ordenados — não re-carrega o PDF
+        alinhada = paginas_alinhadas[idx]
+        resultados = resultados_por_pagina[idx]
 
         vis = alinhada.copy()
         pos = carregar_posicoes(config)
@@ -801,6 +809,12 @@ body {
                         <input type="radio" name="rest-template" value="sao_lazaro_fds"> S. Lázaro FDS
                     </label>
                     <label class="radio" onclick="selectRadio(this, 'rest-template')">
+                        <input type="radio" name="rest-template" value="canela_fds_especial"> Canela FDS Esp.
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-template')">
+                        <input type="radio" name="rest-template" value="sao_lazaro_fds_especial"> S. Lázaro FDS Esp.
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-template')">
                         <input type="radio" name="rest-template" value="todos"> Todos
                     </label>
                 </div>
@@ -827,6 +841,20 @@ body {
                 <div class="label">Data do período <span style="font-weight:400;color:#aaa">(opcional — ex: 10/05 ou 05/05 a 09/05)</span></div>
                 <input type="text" name="data_periodo" placeholder="10/05"
                        style="width:200px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
+            </div>
+
+            <div class="section" id="dias-especial-section" style="display:none;">
+                <div class="label">Dias da lista especial <span style="font-weight:400;color:#aaa">(selecione todos os dias do feriado emendado)</span></div>
+                <div class="radio-group" id="dias-especial-group">
+                    <label class="radio" data-dia="Segunda" onclick="toggleDiaEspecial(this)">Segunda</label>
+                    <label class="radio" data-dia="Terça" onclick="toggleDiaEspecial(this)">Terça</label>
+                    <label class="radio" data-dia="Quarta" onclick="toggleDiaEspecial(this)">Quarta</label>
+                    <label class="radio" data-dia="Quinta" onclick="toggleDiaEspecial(this)">Quinta</label>
+                    <label class="radio" data-dia="Sexta" onclick="toggleDiaEspecial(this)">Sexta</label>
+                    <label class="radio" data-dia="Sábado" onclick="toggleDiaEspecial(this)">Sábado</label>
+                    <label class="radio" data-dia="Domingo" onclick="toggleDiaEspecial(this)">Domingo</label>
+                </div>
+                <input type="hidden" name="dias_especial" id="input-dias-especial">
             </div>
 
             <button type="submit" class="btn" id="btn-template">Gerar template</button>
@@ -863,6 +891,12 @@ body {
                     <label class="radio" onclick="selectRadio(this, 'rest-processar')">
                         <input type="radio" name="rest-processar" value="sao_lazaro_fds"> S. Lázaro FDS
                     </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                        <input type="radio" name="rest-processar" value="canela_fds_especial"> Canela FDS Esp.
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                        <input type="radio" name="rest-processar" value="sao_lazaro_fds_especial"> S. Lázaro FDS Esp.
+                    </label>
                 </div>
             </div>
 
@@ -898,12 +932,6 @@ body {
                     <div class="file-name" id="file-alunos-name"></div>
                     <div class="file-remove" onclick="removeFile('alunos')">remover</div>
                 </div>
-            </div>
-
-            <div class="section">
-                <div class="label">Página de início <span style="font-weight:400;color:#aaa">(padrão: 1 — use outro valor se o scan não começa na pág. 1 do formulário)</span></div>
-                <input type="number" name="pagina_inicio" value="1" min="1"
-                       style="width:80px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
             </div>
 
             <div class="section">
@@ -987,6 +1015,19 @@ function selectRadio(el, name) {
     el.closest('.radio-group').querySelectorAll('.radio').forEach(r => r.classList.remove('selected'));
     el.classList.add('selected');
     el.querySelector('input').checked = true;
+
+    if (name === 'rest-template') {
+        var val = el.querySelector('input').value;
+        var isFdsEsp = val === 'canela_fds_especial' || val === 'sao_lazaro_fds_especial';
+        document.getElementById('dias-especial-section').style.display = isFdsEsp ? '' : 'none';
+        if (!isFdsEsp) {
+            document.querySelectorAll('#dias-especial-group .radio').forEach(function(d) { d.classList.remove('selected'); });
+        }
+    }
+}
+
+function toggleDiaEspecial(el) {
+    el.classList.toggle('selected');
 }
 
 function fileSelected(input, tipo) {
@@ -1024,6 +1065,19 @@ function submitTemplate(e) {
         return false;
     }
     data.set('alunos', alunos.files[0]);
+
+    var isFdsEsp = data.get('restaurante').endsWith('_fds_especial');
+    if (isFdsEsp) {
+        var dias = [];
+        document.querySelectorAll('#dias-especial-group .radio.selected').forEach(function(el) {
+            dias.push(el.getAttribute('data-dia'));
+        });
+        if (!dias.length) {
+            showError('template', 'Selecione ao menos um dia para o FDS especial.');
+            return false;
+        }
+        data.set('dias_especial', dias.join(','));
+    }
 
     showLoading('template', true);
     hideError('template');
@@ -1075,7 +1129,6 @@ function submitProcessar(e) {
 
     data.set('scan', scan.files[0]);
     data.set('alunos', alunos.files[0]);
-    data.set('pagina_inicio', form.querySelector('input[name="pagina_inicio"]').value || '1');
     data.set('periodo_semana', periodo);
 
     showLoading('processar', true);

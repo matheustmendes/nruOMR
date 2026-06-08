@@ -485,12 +485,14 @@ def main():
         print("Uso: python exportar.py <scan.pdf> <config.yaml> <planilha_alunos.xlsx> <aba> [opções]")
         print()
         print("Opções:")
-        print("  --merge scan2.pdf ...      Mescla múltiplos PDFs antes de processar")
-        print("  --correcoes arquivo.json   Aplica correções manuais da revisão")
+        print("  --merge scan2.pdf ...           Mescla múltiplos PDFs antes de processar")
+        print("  --correcoes arquivo.json        Aplica correções manuais da revisão")
+        print('  --periodo "05/05 a 09/05"       Exporta para o dashboard analítico (Looker Studio)')
         print()
         print("Exemplos:")
         print('  python exportar.py scan.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO"')
         print('  python exportar.py scan1.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --merge scan2.pdf')
+        print('  python exportar.py scan.pdf config_canela.yaml alunos.xlsx "CANELA IMPRESSÃO" --periodo "05/05 a 09/05"')
         sys.exit(1)
 
     caminho_scan = sys.argv[1]
@@ -517,6 +519,12 @@ def main():
         with open(caminho_correcoes, "r") as f:
             correcoes = json.load(f)
         print(f"Correções carregadas de {caminho_correcoes}")
+
+    # Checa se tem período informado (para exportação ao dashboard)
+    periodo = None
+    if "--periodo" in sys.argv:
+        idx = sys.argv.index("--periodo")
+        periodo = sys.argv[idx + 1]
 
     # Carrega config
     with open(caminho_config, "r") as f:
@@ -547,6 +555,15 @@ def main():
     nome_restaurante = config.get("restaurante", "resultado").lower().replace(" ", "_")
     arquivo_saida = f"presencas_{nome_restaurante}.xlsx"
     exportar_xlsx(contagem, alunos, dias, arquivo_saida)
+
+    # Exporta para dashboard analítico (Looker Studio)
+    if periodo:
+        from google_sheets import exportar_para_dashboard
+        resultado_dash = exportar_para_dashboard(contagem, alunos, dias, nome_restaurante, periodo)
+        if not resultado_dash.get("ok"):
+            print(f"  Aviso: dashboard não atualizado — {resultado_dash.get('erro')}")
+        else:
+            print("  Dashboard analítico atualizado.")
 
 
 if __name__ == "__main__":

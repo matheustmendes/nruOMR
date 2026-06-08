@@ -22,7 +22,7 @@ Estrutura escrita na planilha (aba mensal, ex: "Maio 2026"):
 
 import os
 import yaml
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     import gspread
@@ -527,6 +527,38 @@ def _desfazer_fds_do_bloco(aba, inicio_1idx, dias_fds):
         aba.batch_update(updates, value_input_option="USER_ENTERED")
 
 
+_DIA_SEMANA_PT = {
+    "Segunda": 0,
+    "Terça":   1,
+    "Quarta":  2,
+    "Quinta":  3,
+    "Sexta":   4,
+    "Sábado":  5,
+    "Domingo": 6,
+}
+
+_UNIDADE_LEGIVEL = {
+    "canela":                    "Canela",
+    "ondina":                    "Ondina",
+    "sao_lazaro":                "São Lázaro",
+    "canela_fds":                "Canela",
+    "sao_lazaro_fds":            "São Lázaro",
+    "canela_fds_especial":       "Canela",
+    "sao_lazaro_fds_especial":   "São Lázaro",
+}
+
+_HEADERS_PRESENCAS = [
+    "matricula", "nome", "unidade", "periodo_letivo", "semana",
+    "data", "dia_semana", "status", "almoco", "janta",
+]
+
+_HEADERS_RESUMO = [
+    "matricula", "nome", "unidade", "periodo_letivo", "semana",
+    "total_sessoes_semana", "presencas_semana", "ausencias_semana",
+    "pct_presenca_semana", "irregular", "faltas_consecutivas",
+]
+
+
 def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forcar=False):
     """
     Exporta dados de presença para Google Sheets.
@@ -641,6 +673,200 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
             return {"ok": True, "aba": nome_aba, "aviso_formatacao": str(e_fmt)}
 
         return {"ok": True, "aba": nome_aba}
+
+    except Exception as e:
+        return {"ok": False, "erro": str(e)}
+
+
+# --- DASHBOARD ANALÍTICO (Looker Studio) ---
+
+def _datas_por_dia(periodo, dias):
+    """
+    Mapeia cada nome de dia para sua data exata dentro do período.
+
+    Usa a data de início do período como âncora e calcula o offset pelo
+    dia da semana, o que suporta tanto semanas regulares (Seg–Sex) quanto
+    FDS e FDS especial (ex: Qui+Sex+Sab).
+    """
+    parte_inicio = periodo.split(" a ")[0].strip()
+    dd, mm = parte_inicio.split("/")
+    dd, mm = int(dd), int(mm)
+    hoje = datetime.now()
+    ano = hoje.year if mm <= hoje.month else hoje.year - 1
+    data_inicio = datetime(ano, mm, dd)
+    start_weekday = data_inicio.weekday()
+
+    resultado = {}
+    for dia in dias:
+        alvo = _DIA_SEMANA_PT.get(dia)
+        if alvo is None:
+            resultado[dia] = data_inicio
+            continue
+        offset = (alvo - start_weekday) % 7
+        resultado[dia] = data_inicio + timedelta(days=offset)
+
+    return resultado
+
+
+def _periodo_letivo(data):
+    return f"{data.year}.1" if data.month <= 6 else f"{data.year}.2"
+
+
+def _faltas_consecutivas(detalhes, dias):
+    max_seq = seq = 0
+    for dia in dias:
+        if not detalhes.get(dia, {}).get("presente", True):
+            seq += 1
+            max_seq = max(max_seq, seq)
+        else:
+            seq = 0
+    return max_seq
+
+
+def _obter_ou_criar_aba_dashboard(spreadsheet, nome_aba, headers):
+    """Obtém a aba ou cria nova com cabeçalhos na linha 1."""
+    try:
+        return spreadsheet.worksheet(nome_aba)
+    except gspread.WorksheetNotFound:
+        aba = spreadsheet.add_worksheet(title=nome_aba, rows=5000, cols=len(headers))
+        aba.append_rows([headers], value_input_option="USER_ENTERED")
+        return aba
+
+
+def _upsert_aba(aba, novos_dados, key_cols):
+    """
+    Faz upsert eficiente em uma aba do Sheets.
+    Máximo 2 chamadas à API por aba: 1 batch_update + 1 append_rows.
+
+    Args:
+        aba: worksheet gspread
+        novos_dados: lista de listas, sem linha de cabeçalho
+        key_cols: tupla de índices de coluna (0-indexed) que formam a chave de upsert
+    """
+    valores = aba.get_all_values()
+
+    # Constrói índice {chave: row_1indexed} pulando o cabeçalho (valores[0])
+    index = {}
+    for i, row in enumerate(valores[1:], start=2):
+        chave = tuple(row[c] if c < len(row) else "" for c in key_cols)
+        index[chave] = i
+
+    updates = []
+    to_append = []
+
+    for row_data in novos_dados:
+        chave = tuple(str(row_data[c]) if c < len(row_data) else "" for c in key_cols)
+        if chave in index:
+            row_num = index[chave]
+            last_col = chr(ord("A") + len(row_data) - 1)
+            updates.append({
+                "range": f"A{row_num}:{last_col}{row_num}",
+                "values": [row_data],
+            })
+        else:
+            to_append.append(row_data)
+
+    if updates:
+        aba.batch_update(updates, value_input_option="USER_ENTERED")
+    if to_append:
+        aba.append_rows(to_append, value_input_option="USER_ENTERED")
+
+
+def exportar_para_dashboard(contagem, alunos, dias, restaurante_key, periodo):
+    """
+    Exporta dados analíticos para a planilha do Looker Studio.
+
+    Popula duas abas fixas em `dashboard_spreadsheet_id`:
+      - presencas: uma linha por aluno por dia (upsert por matricula+data)
+      - resumo_semanal: uma linha por aluno por semana (upsert por matricula+semana+unidade)
+
+    Sempre silenciosa em caso de erro — não interrompe o pipeline.
+
+    Returns:
+        {"ok": True} ou {"ok": False, "erro": "..."}
+    """
+    try:
+        config = _carregar_config()
+
+        dashboard_id = config.get("dashboard_spreadsheet_id", "").strip()
+        if not dashboard_id:
+            return {
+                "ok": False,
+                "erro": "dashboard_spreadsheet_id não configurado em config_sheets.yaml",
+            }
+
+        threshold = config.get("irregularidade_threshold", 0.75)
+
+        cliente = _obter_cliente(config)
+        spreadsheet = cliente.open_by_key(dashboard_id)
+
+        aba_presencas = _obter_ou_criar_aba_dashboard(
+            spreadsheet, "presencas", _HEADERS_PRESENCAS
+        )
+        aba_resumo = _obter_ou_criar_aba_dashboard(
+            spreadsheet, "resumo_semanal", _HEADERS_RESUMO
+        )
+
+        unidade = _UNIDADE_LEGIVEL.get(restaurante_key, restaurante_key)
+        datas = _datas_por_dia(periodo, dias)
+
+        data_base = next(iter(datas.values())) if datas else datetime.now()
+        pl = _periodo_letivo(data_base)
+
+        # Linhas para `presencas` — uma por aluno por dia
+        linhas_presencas = []
+        for c in contagem:
+            idx = c["numero"] - 1
+            nome, matricula = (alunos[idx] if 0 <= idx < len(alunos)
+                               else (f"Aluno {c['numero']}", ""))
+            for dia in dias:
+                det = c["detalhes"].get(
+                    dia, {"presente": False, "almoco": False, "janta": False}
+                )
+                data_dia = datas.get(dia, data_base)
+                linhas_presencas.append([
+                    matricula,
+                    nome,
+                    unidade,
+                    pl,
+                    periodo,
+                    data_dia.strftime("%d/%m/%Y"),
+                    dia,
+                    "presente" if det["presente"] else "ausente",
+                    det["almoco"],
+                    det["janta"],
+                ])
+
+        # Linhas para `resumo_semanal` — uma por aluno por semana
+        total_sessoes = len(dias)
+        linhas_resumo = []
+        for c in contagem:
+            idx = c["numero"] - 1
+            nome, matricula = (alunos[idx] if 0 <= idx < len(alunos)
+                               else (f"Aluno {c['numero']}", ""))
+            presencas_sem = c["presencas"]
+            ausencias_sem = total_sessoes - presencas_sem
+            pct = presencas_sem / total_sessoes if total_sessoes > 0 else 0.0
+            linhas_resumo.append([
+                matricula,
+                nome,
+                unidade,
+                pl,
+                periodo,
+                total_sessoes,
+                presencas_sem,
+                ausencias_sem,
+                round(pct, 4),
+                pct < threshold,
+                _faltas_consecutivas(c["detalhes"], dias),
+            ])
+
+        # presencas: chave = matricula (col 0) + data (col 5)
+        _upsert_aba(aba_presencas, linhas_presencas, (0, 5))
+        # resumo_semanal: chave = matricula (col 0) + semana (col 4) + unidade (col 2)
+        _upsert_aba(aba_resumo, linhas_resumo, (0, 4, 2))
+
+        return {"ok": True}
 
     except Exception as e:
         return {"ok": False, "erro": str(e)}

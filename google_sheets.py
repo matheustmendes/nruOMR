@@ -555,7 +555,8 @@ _HEADERS_PRESENCAS = [
 _HEADERS_RESUMO = [
     "matricula", "nome", "unidade", "periodo_letivo", "semana",
     "total_sessoes_semana", "presencas_semana", "ausencias_semana",
-    "pct_presenca_semana", "irregular", "faltas_consecutivas",
+    "pct_presenca_semana", "irregular", "faltas_consecutivas", "mes",
+    "data_inicio_semana",
 ]
 
 
@@ -712,6 +713,13 @@ def _periodo_letivo(data):
     return f"{data.year}.1" if data.month <= 6 else f"{data.year}.2"
 
 
+def _semana_ancora(data):
+    """Retorna 'DD/MM a DD/MM' da Seg–Sex da semana que contém `data` (para FDS)."""
+    monday = data - timedelta(days=data.weekday())
+    friday = monday + timedelta(days=4)
+    return f"{monday.strftime('%d/%m')} a {friday.strftime('%d/%m')}"
+
+
 def _faltas_consecutivas(detalhes, dias):
     max_seq = seq = 0
     for dia in dias:
@@ -772,6 +780,65 @@ def _upsert_aba(aba, novos_dados, key_cols):
         aba.append_rows(to_append, value_input_option="USER_ENTERED")
 
 
+def _upsert_resumo_fds(aba, linhas_fds, threshold):
+    """
+    Mescla dados FDS no resumo_semanal de forma aditiva.
+
+    Quando a linha da semana regular já existe (mesma matricula+semana+unidade),
+    soma presenças e sessões e recalcula pct/irregular. Caso contrário insere nova.
+    faltas_consecutivas mantém o valor da semana regular (mais representativo).
+    """
+    valores = aba.get_all_values()
+
+    index = {}
+    for i, row in enumerate(valores[1:], start=2):
+        if len(row) >= 5:
+            chave = (row[0], row[4], row[2])  # matricula, semana, unidade
+            index[chave] = i
+
+    updates = []
+    to_append = []
+
+    for row_data in linhas_fds:
+        chave = (str(row_data[0]), str(row_data[4]), str(row_data[2]))
+
+        if chave in index:
+            row_num = index[chave]
+            ex = valores[row_num - 1]
+
+            def _int(col):
+                try:
+                    return int(ex[col]) if col < len(ex) and ex[col].strip() else 0
+                except ValueError:
+                    return 0
+
+            novo_total      = _int(5) + row_data[5]
+            novas_presencas = _int(6) + row_data[6]
+            novas_ausencias = novo_total - novas_presencas
+            novo_pct        = round(novas_presencas / novo_total, 4) if novo_total > 0 else 0.0
+
+            nova_linha = [
+                row_data[0], row_data[1], row_data[2], row_data[3], row_data[4],
+                novo_total, novas_presencas, novas_ausencias,
+                novo_pct, novo_pct < threshold,
+                _int(10),
+                row_data[11],  # mes
+                row_data[12],  # data_inicio_semana
+            ]
+            last_col = chr(ord("A") + len(nova_linha) - 1)
+            updates.append({
+                "range": f"A{row_num}:{last_col}{row_num}",
+                "values": [nova_linha],
+            })
+        else:
+            to_append.append(row_data)
+
+    if updates:
+        aba.batch_update(updates, value_input_option="USER_ENTERED")
+    if to_append:
+        aba.append_rows(to_append, value_input_option="USER_ENTERED")
+
+
 def exportar_para_dashboard(contagem, alunos, dias, restaurante_key, periodo):
     """
     Exporta dados analíticos para a planilha do Looker Studio.
@@ -807,11 +874,16 @@ def exportar_para_dashboard(contagem, alunos, dias, restaurante_key, periodo):
             spreadsheet, "resumo_semanal", _HEADERS_RESUMO
         )
 
+        eh_fds = restaurante_key in _RESTAURANTE_PAI
         unidade = _UNIDADE_LEGIVEL.get(restaurante_key, restaurante_key)
         datas = _datas_por_dia(periodo, dias)
 
         data_base = next(iter(datas.values())) if datas else datetime.now()
         pl = _periodo_letivo(data_base)
+        semana_resumo = _semana_ancora(data_base) if eh_fds else periodo
+        mes = f"{_MESES[data_base.month - 1]} {data_base.year}"
+        monday = data_base - timedelta(days=data_base.weekday())
+        data_inicio_semana = monday.strftime("%Y-%m-%d")
 
         # Linhas para `presencas` — uma por aluno por dia
         linhas_presencas = []
@@ -852,19 +924,24 @@ def exportar_para_dashboard(contagem, alunos, dias, restaurante_key, periodo):
                 nome,
                 unidade,
                 pl,
-                periodo,
+                semana_resumo,
                 total_sessoes,
                 presencas_sem,
                 ausencias_sem,
                 round(pct, 4),
                 pct < threshold,
                 _faltas_consecutivas(c["detalhes"], dias),
+                mes,
+                data_inicio_semana,
             ])
 
-        # presencas: chave = matricula (col 0) + data (col 5)
+        # presencas: chave = matricula (col 0) + data (col 5) — FDS tem datas distintas, sem conflito
         _upsert_aba(aba_presencas, linhas_presencas, (0, 5))
-        # resumo_semanal: chave = matricula (col 0) + semana (col 4) + unidade (col 2)
-        _upsert_aba(aba_resumo, linhas_resumo, (0, 4, 2))
+        # resumo_semanal: FDS soma na linha da semana regular; caso contrário upsert normal
+        if eh_fds:
+            _upsert_resumo_fds(aba_resumo, linhas_resumo, threshold)
+        else:
+            _upsert_aba(aba_resumo, linhas_resumo, (0, 4, 2))
 
         return {"ok": True}
 

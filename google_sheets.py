@@ -354,10 +354,11 @@ def _aplicar_formatacao(spreadsheet, aba, linha_inicio_1idx, num_alunos, num_dia
 # e mesclam os dados no bloco da semana já existente.
 # FDS especial = feriado emendado com dias customizáveis (ex: Qui+Sex+Sab).
 _RESTAURANTE_PAI = {
-    "canela_fds":           "canela",
-    "sao_lazaro_fds":       "sao_lazaro",
-    "canela_fds_especial":  "canela",
+    "canela_fds":              "canela",
+    "sao_lazaro_fds":          "sao_lazaro",
+    "canela_fds_especial":     "canela",
     "sao_lazaro_fds_especial": "sao_lazaro",
+    "ondina_fds_especial":     "ondina",
 }
 
 
@@ -545,6 +546,7 @@ _UNIDADE_LEGIVEL = {
     "sao_lazaro_fds":            "São Lázaro",
     "canela_fds_especial":       "Canela",
     "sao_lazaro_fds_especial":   "São Lázaro",
+    "ondina_fds_especial":       "Ondina",
 }
 
 _HEADERS_PRESENCAS = [

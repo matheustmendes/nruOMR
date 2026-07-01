@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard — Presenças Irregulares</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <style>
+    :root { --azul: #1E6BA5; --azul-cl: #D6E8F7; }
+
+    body { background: #f2f5f9; font-size: 0.92rem; }
+
+    /* Navbar */
+    .navbar { background: var(--azul) !important; }
+    .navbar-brand { font-weight: 700; letter-spacing: .3px; }
+
+    /* Filtros */
+    .filtros-bar { background: #fff; border-bottom: 1px solid #e2e8f0; }
+
+    /* Cards de stats */
+    .stat-card {
+      border: none; border-radius: 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,.08);
+      transition: transform .15s;
+    }
+    .stat-card:hover { transform: translateY(-2px); }
+    .stat-num { font-size: 2rem; font-weight: 700; line-height: 1; }
+
+    /* Tabela */
+    .card-tabela {
+      border: none; border-radius: 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,.08); overflow: hidden;
+    }
+    .table thead th {
+      background: var(--azul); color: #fff;
+      font-weight: 600; white-space: nowrap;
+      border: none;
+    }
+    .table tbody tr { vertical-align: middle; }
+    .row-irreg    { background: #fff5f5; }
+    .row-just     { background: #f0fff4; }
+    .row-pendente { background: #fffdf0; }
+    .row-negado   { background: #fff4ec; }
+    .row-irreg:hover    { background: #ffe8e8; }
+    .row-just:hover     { background: #ddfbe8; }
+    .row-pendente:hover { background: #fff8d6; }
+    .row-negado:hover   { background: #ffe8d6; }
+    .bg-orange { background-color: #e67e22 !important; }
+
+    /* Linha principal clicável */
+    tr.expandivel { cursor: pointer; }
+    tr.expandivel:hover td { filter: brightness(.97); }
+
+    /* Linha de detalhe da justificativa */
+    .detail-row td { padding: 0 !important; border-top: none !important; }
+    .detail-inner {
+      padding: 12px 16px 14px;
+      background: #f8fafc;
+      border-top: 1px dashed #cbd5e1;
+      border-bottom: 2px solid #e2e8f0;
+    }
+    .detail-label { font-size: .7rem; text-transform: uppercase;
+                    letter-spacing: .06em; color: #94a3b8; margin-bottom: 2px; }
+    .detail-val   { font-size: .85rem; color: #1e293b; word-break: break-word; }
+    .detail-val.vazio { color: #94a3b8; font-style: italic; }
+
+    /* Dropdown de dias */
+    .dias-toggle {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: .75rem; color: #64748b; cursor: pointer;
+      border: 1px solid #e2e8f0; border-radius: 6px;
+      padding: 3px 8px; background: #fff; user-select: none;
+      margin-top: 10px; transition: all .15s;
+    }
+    .dias-toggle:hover { border-color: var(--azul); color: var(--azul); }
+
+    .dias-table { font-size: .8rem; border-collapse: collapse; width: 100%; margin-top: 8px; }
+    .dias-table th {
+      background: #e8f0fe; color: #1e3a8a; font-weight: 600;
+      text-align: center; padding: 4px 8px; border: 1px solid #c7d7f9;
+      white-space: nowrap;
+    }
+    .dias-table th.col-semana { text-align: left; min-width: 120px; }
+    .dias-table td {
+      text-align: center; padding: 4px 8px;
+      border: 1px solid #e2e8f0; white-space: nowrap;
+    }
+    .dias-table td.col-semana { text-align: left; color: #64748b; font-size: .75rem; }
+    .dia-aj   { color: #1d4ed8; font-weight: 600; }
+    .dia-a    { color: #15803d; font-weight: 600; }
+    .dia-j    { color: #0369a1; font-weight: 600; }
+    .dia-out  { color: #dc2626; font-weight: 600; }
+    .dia-ausen{ color: #cbd5e1; }
+
+    /* Spinner overlay */
+    .spinner-overlay {
+      position: fixed; inset: 0;
+      background: rgba(255,255,255,.75);
+      z-index: 9999; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 12px;
+    }
+
+    /* Estado vazio / erro */
+    .estado-vazio { padding: 64px 24px; text-align: center; color: #6c757d; }
+    .estado-vazio .icone { font-size: 3rem; margin-bottom: .75rem; }
+
+    /* Info box de configuração */
+    .info-cfg { background: #f8fafc; border-left: 4px solid var(--azul); border-radius: 6px; }
+    pre.cfg-sample { background: #1a2233; color: #e2e8f0; border-radius: 8px;
+      font-size: .8rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+
+<!-- ═══ Navbar ═══════════════════════════════════════════════════════════ -->
+<nav class="navbar navbar-dark">
+  <div class="container-xl d-flex align-items-center">
+    <span class="navbar-brand me-auto">
+      <i class="bi bi-clipboard-data-fill me-2"></i>Presenças Irregulares
+    </span>
+    <div class="d-flex gap-2">
+      <button id="btn-reload" class="btn btn-outline-light btn-sm" title="Limpa cache e recarrega do Sheets">
+        <i class="bi bi-arrow-clockwise me-1"></i>Recarregar
+      </button>
+      <button id="btn-export" class="btn btn-light btn-sm fw-semibold">
+        <i class="bi bi-file-earmark-excel-fill me-1 text-success"></i>Exportar XLSX
+      </button>
+    </div>
+  </div>
+</nav>
+
+<!-- ═══ Filtros ══════════════════════════════════════════════════════════ -->
+<div class="filtros-bar">
+  <div class="container-xl py-3">
+    <div class="row g-3 align-items-end">
+
+      <div class="col-auto">
+        <label class="form-label fw-semibold mb-1 small">Mês de referência</label>
+        <select id="sel-mes" class="form-select form-select-sm" style="min-width:170px;"></select>
+      </div>
+
+      <div class="col-auto">
+        <label class="form-label fw-semibold mb-1 small">Unidade</label>
+        <select id="sel-unidade" class="form-select form-select-sm">
+          <option value="">Todas</option>
+          <option value="canela">Canela</option>
+          <option value="ondina">Ondina</option>
+          <option value="sao_lazaro">São Lázaro</option>
+        </select>
+      </div>
+
+      <div class="col-auto">
+        <label class="form-label fw-semibold mb-1 small">Exibir</label>
+        <select id="sel-status" class="form-select form-select-sm">
+          <option value="todos">Todos irregulares</option>
+          <option value="irregular">Sem justificativa</option>
+          <option value="pendente">Pendentes</option>
+          <option value="justificado">Justificados</option>
+          <option value="negado">Negados</option>
+        </select>
+      </div>
+
+      <div class="col-auto ms-auto">
+        <label class="form-label fw-semibold mb-1 small">Buscar</label>
+        <div class="input-group input-group-sm" style="min-width:230px;">
+          <span class="input-group-text bg-white"><i class="bi bi-search text-muted"></i></span>
+          <input type="text" id="input-busca" class="form-control" placeholder="Nome ou matrícula…">
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Conteúdo principal ═══════════════════════════════════════════════ -->
+<div class="container-xl py-4">
+
+  <!-- Alerta de erro -->
+  <div id="alerta-erro" class="alert alert-danger alert-dismissible d-none mb-4" role="alert">
+    <i class="bi bi-exclamation-triangle-fill me-2"></i>
+    <span id="alerta-msg"></span>
+    <button type="button" class="btn-close" onclick="this.closest('.alert').classList.add('d-none')"></button>
+  </div>
+
+  <!-- Cards de estatísticas -->
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-xl">
+      <div class="card stat-card p-3 text-center h-100">
+        <div class="text-muted small mb-1">Total de bolsistas</div>
+        <div class="stat-num text-primary" id="s-total">—</div>
+      </div>
+    </div>
+    <div class="col-6 col-xl">
+      <div class="card stat-card p-3 text-center h-100">
+        <div class="text-muted small mb-1">Irregulares</div>
+        <div class="stat-num text-danger" id="s-irreg">—</div>
+        <div class="small text-muted">&lt; {{ limite }} pres./mês</div>
+      </div>
+    </div>
+    <div class="col-6 col-xl">
+      <div class="card stat-card p-3 text-center h-100">
+        <div class="text-muted small mb-1">Justificados</div>
+        <div class="stat-num text-success" id="s-just">—</div>
+        <div class="small text-muted">contabilizados</div>
+      </div>
+    </div>
+    <div class="col-6 col-xl">
+      <div class="card stat-card p-3 text-center h-100">
+        <div class="text-muted small mb-1">Pendentes</div>
+        <div class="stat-num text-warning" id="s-pend">—</div>
+        <div class="small text-muted">aguardando parecer</div>
+      </div>
+    </div>
+    <div class="col-6 col-xl">
+      <div class="card stat-card p-3 text-center h-100">
+        <div class="text-muted small mb-1">Negados</div>
+        <div class="stat-num text-orange" id="s-neg" style="color:#e67e22;">—</div>
+        <div class="small text-muted">parecer negado</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tabela de irregulares -->
+  <div class="card card-tabela mb-4">
+    <div class="card-header bg-white py-3 d-flex align-items-center gap-2 border-bottom">
+      <i class="bi bi-exclamation-circle-fill text-danger"></i>
+      <span class="fw-bold">Bolsistas com Presença Irregular</span>
+      <span class="text-muted small ms-1">(clique na justificativa para expandir)</span>
+      <span class="ms-auto badge bg-secondary rounded-pill" id="badge-count" style="display:none!important"></span>
+    </div>
+
+    <div id="table-wrapper">
+      <div class="estado-vazio">
+        <div class="icone"><i class="bi bi-calendar3"></i></div>
+        Selecione um mês para carregar os dados.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Formulários de Justificativas ═══════════════════════════════ -->
+  <div class="card border-0 mb-4">
+    <div class="card-body info-cfg p-4">
+      <h6 class="fw-bold mb-3">
+        <i class="bi bi-ui-checks-grid text-primary me-2"></i>
+        Formulários de Justificativas
+      </h6>
+
+      <p class="small mb-2">Cole o link da planilha de respostas do Google Forms do mês atual:</p>
+
+      <div class="row g-2 mb-3 align-items-end">
+        <div class="col-12 col-md-6">
+          <label class="form-label small mb-1">URL da planilha de respostas</label>
+          <input type="text" id="form-url" class="form-control form-control-sm"
+                 placeholder="https://docs.google.com/spreadsheets/d/…">
+        </div>
+        <div class="col-12 col-md-3">
+          <label class="form-label small mb-1">Identificação (ex: Junho 2026)</label>
+          <input type="text" id="form-label-inp" class="form-control form-control-sm"
+                 placeholder="Junho 2026">
+        </div>
+        <div class="col-auto">
+          <button id="btn-add-form" class="btn btn-primary btn-sm">
+            <i class="bi bi-plus-circle me-1"></i>Adicionar
+          </button>
+        </div>
+      </div>
+
+      <div id="form-erro" class="alert alert-danger py-1 px-3 small d-none mb-3"></div>
+
+      <div id="form-lista" class="mb-3"></div>
+
+      <p class="small text-muted mb-0">
+        <i class="bi bi-info-circle me-1"></i>
+        O formulário padrão de <code>config_sheets.yaml</code> é incluído automaticamente.
+        Compartilhe cada planilha com o <code>client_email</code> de <code>credentials_sheets.json</code>
+        com permissão de <strong>Leitor</strong>.
+      </p>
+    </div>
+  </div>
+
+</div><!-- /container-xl -->
+
+<!-- Spinner -->
+<div id="spinner" class="spinner-overlay d-none">
+  <div class="spinner-border text-primary" style="width:2.5rem;height:2.5rem;" role="status"></div>
+  <div class="text-muted small">Carregando dados…</div>
+</div>
+
+<!-- ═══ Scripts ══════════════════════════════════════════════════════════ -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+"use strict";
+
+const MESES = [
+  "Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+  "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"
+];
+const UNIDADE_LEGIVEL = { canela:"Canela", ondina:"Ondina", sao_lazaro:"São Lázaro" };
+
+// status_just → { rowClass, badgeClass, label }
+const STATUS_CFG = {
+  justificado: { row:"row-just",    badge:"bg-success",               label:"Justificado" },
+  pendente:    { row:"row-pendente",badge:"bg-warning text-dark",      label:"Pendente"    },
+  negado:      { row:"row-negado",  badge:"bg-orange",                 label:"Negado"      },
+  irregular:   { row:"row-irreg",   badge:"bg-danger",                 label:"Irregular"   },
+};
+
+let _dados = [];
+
+// ── Seletor de meses ───────────────────────────────────────────────────────
+function popularSelectMes() {
+  const sel  = document.getElementById("sel-mes");
+  const hoje = new Date();
+  for (let i = 0; i < 18; i++) {
+    const d   = new Date(hoje.getFullYear(), hoje.getMonth() - i, 1);
+    const lbl = `${MESES[d.getMonth()]} ${d.getFullYear()}`;
+    sel.appendChild(Object.assign(document.createElement("option"),
+      { value: lbl, textContent: lbl, selected: i === 0 }));
+  }
+}
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function setLoading(on) { $("spinner").classList.toggle("d-none", !on); }
+
+function setErro(msg) {
+  const el = $("alerta-erro");
+  if (msg) { $("alerta-msg").textContent = msg; el.classList.remove("d-none"); }
+  else      { el.classList.add("d-none"); }
+}
+
+function escHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+// ── Renderizar tabela ──────────────────────────────────────────────────────
+function renderTabela() {
+  const busca  = $("input-busca").value.toLowerCase().trim();
+  const filtro = $("sel-status").value;
+  const wrapper = $("table-wrapper");
+
+  let lista = _dados;
+  if (filtro !== "todos") lista = lista.filter(a => a.status_just === filtro);
+  if (busca)              lista = lista.filter(a =>
+    a.nome.toLowerCase().includes(busca) || a.matricula.toLowerCase().includes(busca));
+
+  if (!lista.length) {
+    const msg = _dados.length === 0
+      ? `<div class="icone"><i class="bi bi-check-circle-fill text-success" style="font-size:3rem;"></i></div>
+         <h5 class="mt-2">Nenhuma irregularidade encontrada</h5>
+         <p>Todos os bolsistas atingiram o mínimo de {{ limite }} presenças no mês.</p>`
+      : `<div class="icone"><i class="bi bi-funnel"></i></div>
+         <p class="mb-0">Nenhum resultado para os filtros aplicados.</p>`;
+    wrapper.innerHTML = `<div class="estado-vazio">${msg}</div>`;
+    return;
+  }
+
+  function detalheCell(label, val, isLink) {
+    if (isLink && val) {
+      return `<div><div class="detail-label">${label}</div>
+              <div class="detail-val">
+                <a href="${escHtml(val)}" target="_blank" class="text-primary">
+                  <i class="bi bi-file-earmark-text me-1"></i>Ver comprovante
+                </a>
+              </div></div>`;
+    }
+    const cls = val ? "detail-val" : "detail-val vazio";
+    return `<div><div class="detail-label">${label}</div>
+            <div class="${cls}">${val ? escHtml(val) : "—"}</div></div>`;
+  }
+
+  const linhas = lista.map((a, i) => {
+    const st         = STATUS_CFG[a.status_just] || STATUS_CFG.irregular;
+    const presCorCls = a.status_just === "justificado" ? "text-success" : "text-danger";
+    const rowId      = `det-${i}`;
+    const diasId     = `dias-${i}`;
+
+    // ── Linha principal (6 colunas, sempre clicável) ──────────────────────
+    const mainRow = `
+      <tr class="${st.row} expandivel" onclick="toggleDetalhe('${rowId}', ${i})">
+        <td class="text-center text-muted small ps-3">${i + 1}</td>
+        <td>
+          <div class="fw-semibold">${escHtml(a.nome)}</div>
+          <div class="small text-muted"><code>${escHtml(a.matricula)}</code></div>
+        </td>
+        <td class="text-center small">${escHtml(UNIDADE_LEGIVEL[a.unidade] || a.unidade)}</td>
+        <td class="text-center fw-bold ${presCorCls}">${a.presencas_mes}</td>
+        <td class="text-center">
+          <span class="badge ${st.badge} rounded-pill">${st.label}</span>
+        </td>
+        <td class="text-center pe-3">
+          <i class="bi bi-chevron-down small text-muted" id="chev-${i}"></i>
+        </td>
+      </tr>`;
+
+    // ── Justificativa (só se tiver) ───────────────────────────────────────
+    const temJust    = a.status_just !== "irregular";
+    const compIsLink = a.comprovante && a.comprovante.startsWith("http");
+    const justSection = temJust ? `
+      <div class="row g-3 mb-2">
+        <div class="col-12 col-md-4">
+          ${detalheCell("Datas declaradas", a.datas)}
+        </div>
+        <div class="col-12 col-md-4">
+          ${detalheCell("Comprovante", a.comprovante, compIsLink)}
+        </div>
+        <div class="col-12 col-md-4">
+          ${detalheCell("Parecer", a.parecer + (a.contabilizado ? ` · Contabilizado: ${a.contabilizado}` : ""))}
+        </div>
+        ${a.comentario ? `<div class="col-12">${detalheCell("Comentário", a.comentario)}</div>` : ""}
+      </div>` : "";
+
+    // ── Tabela de dias ────────────────────────────────────────────────────
+    const semanas = a.semanas || [];
+    let diasSection = "";
+    if (semanas.length) {
+      // Coletamos todos os dias distintos em ordem
+      const ordemDias = ["Seg","Ter","Qua","Qui","Sex","Sáb"];
+      const diasUsados = ordemDias.filter(d =>
+        semanas.some(s => d in (s.dias || {}))
+      );
+
+      function diaCell(val) {
+        if (!val) return `<span class="dia-ausen">—</span>`;
+        const v = val.toUpperCase();
+        if (v === "AJ") return `<span class="dia-aj">AJ</span>`;
+        if (v === "A")  return `<span class="dia-a">A</span>`;
+        if (v === "J")  return `<span class="dia-j">J</span>`;
+        return `<span class="dia-out">${escHtml(val)}</span>`;
+      }
+
+      const thDias = diasUsados.map(d => `<th>${d}</th>`).join("");
+      const trSemanas = semanas.map(s => {
+        const tds = diasUsados.map(d => `<td>${diaCell((s.dias||{})[d])}</td>`).join("");
+        const presTag = s.presencas > 0
+          ? `<span class="badge bg-primary bg-opacity-10 text-primary ms-1">${s.presencas}</span>`
+          : `<span class="badge bg-danger bg-opacity-10 text-danger ms-1">0</span>`;
+        return `<tr>
+          <td class="col-semana">${escHtml(s.periodo)} ${presTag}</td>
+          ${tds}
+        </tr>`;
+      }).join("");
+
+      diasSection = `
+        <div>
+          <div class="dias-toggle" onclick="event.stopPropagation();toggleDias('${diasId}',this)">
+            <i class="bi bi-calendar3"></i> Ver presenças por dia
+            <i class="bi bi-chevron-down" style="font-size:.65rem;"></i>
+          </div>
+          <div id="${diasId}" class="d-none" style="overflow-x:auto;">
+            <table class="dias-table">
+              <thead>
+                <tr>
+                  <th class="col-semana">Semana</th>
+                  ${thDias}
+                </tr>
+              </thead>
+              <tbody>${trSemanas}</tbody>
+            </table>
+            <div class="mt-1" style="font-size:.7rem;color:#94a3b8;">
+              <b>A</b> = almoço &nbsp;·&nbsp; <b>J</b> = janta &nbsp;·&nbsp; <b>AJ</b> = ambos &nbsp;·&nbsp; <span class="dia-ausen">—</span> = ausente
+            </div>
+          </div>
+        </div>`;
+    }
+
+    // ── Linha de detalhe completa ─────────────────────────────────────────
+    const detalheRow = `
+      <tr class="detail-row d-none" id="${rowId}">
+        <td colspan="6">
+          <div class="detail-inner">
+            ${justSection}
+            ${diasSection || '<div class="detail-val vazio">Sem dados de frequência diária.</div>'}
+          </div>
+        </td>
+      </tr>`;
+
+    return mainRow + detalheRow;
+  }).join("");
+
+  wrapper.innerHTML = `
+    <table class="table table-hover mb-0">
+      <thead>
+        <tr>
+          <th class="ps-3" style="width:48px;">Nº</th>
+          <th>Nome / Matrícula</th>
+          <th class="text-center">Unidade</th>
+          <th class="text-center">Presenças</th>
+          <th class="text-center">Status</th>
+          <th class="pe-3" style="width:36px;"></th>
+        </tr>
+      </thead>
+      <tbody>${linhas}</tbody>
+    </table>`;
+}
+
+function toggleDetalhe(id, idx) {
+  const det  = document.getElementById(id);
+  const chev = document.getElementById(`chev-${idx}`);
+  const hide = !det.classList.contains("d-none");
+  det.classList.toggle("d-none", hide);
+  chev.classList.toggle("bi-chevron-down", hide);
+  chev.classList.toggle("bi-chevron-up",  !hide);
+}
+
+function toggleDias(id, btn) {
+  const el   = document.getElementById(id);
+  const hide = !el.classList.contains("d-none");
+  el.classList.toggle("d-none", hide);
+  const chev = btn.querySelector(".bi-chevron-down, .bi-chevron-up");
+  if (chev) {
+    chev.classList.toggle("bi-chevron-down", hide);
+    chev.classList.toggle("bi-chevron-up",  !hide);
+  }
+}
+
+// ── Fetch de dados ─────────────────────────────────────────────────────────
+async function carregarDados() {
+  const mes     = $("sel-mes").value;
+  const unidade = $("sel-unidade").value;
+  if (!mes) return;
+
+  setLoading(true);
+  setErro(null);
+
+  try {
+    const res  = await fetch(`/api/dados?${new URLSearchParams({ mes, unidade })}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.erro || "Erro ao carregar dados.");
+
+    _dados = data.irregulares || [];
+
+    $("s-total").textContent = data.stats.total_alunos;
+    $("s-irreg").textContent = data.stats.total_irregulares;
+    $("s-just").textContent  = data.stats.justificados;
+    $("s-pend").textContent  = data.stats.pendentes;
+    $("s-neg").textContent   = data.stats.negados;
+
+    renderTabela();
+  } catch (e) {
+    setErro(e.message);
+    $("table-wrapper").innerHTML =
+      `<div class="estado-vazio">
+         <div class="icone"><i class="bi bi-wifi-off"></i></div>
+         <p>Não foi possível carregar os dados.<br>
+            Verifique as credenciais e os IDs em <code>config_sheets.yaml</code>.</p>
+       </div>`;
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ── Eventos ────────────────────────────────────────────────────────────────
+$("sel-mes").addEventListener("change", carregarDados);
+$("sel-unidade").addEventListener("change", carregarDados);
+$("sel-status").addEventListener("change", renderTabela);
+$("input-busca").addEventListener("input", renderTabela);
+
+$("btn-reload").addEventListener("click", async () => {
+  setLoading(true);
+  try { await fetch("/api/recarregar", { method: "POST" }); } finally { setLoading(false); }
+  carregarDados();
+});
+
+$("btn-export").addEventListener("click", () => {
+  const mes = $("sel-mes").value;
+  if (!mes) { alert("Selecione um mês antes de exportar."); return; }
+  window.location.href = `/exportar?${new URLSearchParams({ mes, unidade: $("sel-unidade").value })}`;
+});
+
+// ── Formulários de Justificativas ─────────────────────────────────────────
+async function carregarFormularios() {
+  try {
+    const res  = await fetch("/api/config/formularios");
+    const data = await res.json();
+    const lista = data.formularios || [];
+    const el = $("form-lista");
+    if (!lista.length) {
+      el.innerHTML = '<p class="small text-muted mb-0">Nenhum formulário adicional cadastrado.</p>';
+      return;
+    }
+    el.innerHTML = `
+      <div class="small fw-semibold text-muted mb-2">Formulários cadastrados:</div>
+      <ul class="list-group list-group-flush">
+        ${lista.map(f => `
+          <li class="list-group-item d-flex align-items-center px-0 py-2">
+            <div class="flex-grow-1">
+              <div class="fw-semibold small">${escHtml(f.label)}</div>
+              <code class="text-muted" style="font-size:.75rem;">${escHtml(f.id)}</code>
+            </div>
+            <a href="https://docs.google.com/spreadsheets/d/${escHtml(f.id)}/edit"
+               target="_blank" class="btn btn-outline-secondary btn-sm me-2" title="Abrir planilha">
+              <i class="bi bi-box-arrow-up-right"></i>
+            </a>
+            <button class="btn btn-outline-danger btn-sm"
+                    onclick="removerFormulario('${escHtml(f.id)}')">
+              <i class="bi bi-trash3"></i>
+            </button>
+          </li>`).join("")}
+      </ul>`;
+  } catch (e) {
+    console.error("Erro ao carregar formulários:", e);
+  }
+}
+
+async function adicionarFormulario() {
+  const url    = $("form-url").value.trim();
+  const label  = $("form-label-inp").value.trim();
+  const erroEl = $("form-erro");
+  erroEl.classList.add("d-none");
+
+  if (!url) {
+    erroEl.textContent = "Cole a URL da planilha.";
+    erroEl.classList.remove("d-none");
+    return;
+  }
+
+  const res  = await fetch("/api/config/formularios", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, label }),
+  });
+  const data = await res.json();
+  if (!data.ok) {
+    erroEl.textContent = data.erro;
+    erroEl.classList.remove("d-none");
+    return;
+  }
+
+  $("form-url").value       = "";
+  $("form-label-inp").value = "";
+  await carregarFormularios();
+  await fetch("/api/recarregar", { method: "POST" });
+  carregarDados();
+}
+
+async function removerFormulario(id) {
+  if (!confirm("Remover este formulário da lista?")) return;
+  const res  = await fetch(`/api/config/formularios/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const data = await res.json();
+  if (!data.ok) { alert(data.erro); return; }
+  await carregarFormularios();
+  await fetch("/api/recarregar", { method: "POST" });
+  carregarDados();
+}
+
+$("btn-add-form").addEventListener("click", adicionarFormulario);
+
+// ── Init ───────────────────────────────────────────────────────────────────
+popularSelectMes();
+carregarFormularios();
+carregarDados();
+</script>
+</body>
+</html>

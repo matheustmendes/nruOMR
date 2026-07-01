@@ -22,6 +22,7 @@ from io import BytesIO
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flask import Flask, request, send_file, jsonify, Response
+from pypdf import PdfWriter, PdfReader
 
 import cv2
 import numpy as np
@@ -100,6 +101,19 @@ def index():
     return HTML_PAGE
 
 
+def _mesclar_pdfs(paths):
+    writer = PdfWriter()
+    for path in paths:
+        reader = PdfReader(path)
+        for page in reader.pages:
+            writer.add_page(page)
+    merged = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    merged.close()
+    with open(merged.name, "wb") as f:
+        writer.write(f)
+    return merged.name
+
+
 @app.route("/processar", methods=["POST"])
 def rota_processar():
     try:
@@ -107,16 +121,33 @@ def rota_processar():
         if restaurante_key not in RESTAURANTES:
             return jsonify({"erro": "Restaurante inválido"}), 400
 
-        scan_file = request.files.get("scan")
+        scan_files = request.files.getlist("scan")
         alunos_file = request.files.get("alunos")
 
-        if not scan_file or not alunos_file:
+        if not scan_files or not scan_files[0].filename:
             return jsonify({"erro": "Envie o scan e a planilha de alunos"}), 400
+        if not alunos_file:
+            return jsonify({"erro": "Envie a planilha de alunos"}), 400
 
         # Salva arquivos temporários — fecha imediatamente após salvar (necessário no Windows)
-        scan_tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        scan_tmp.close()
-        scan_file.save(scan_tmp.name)
+        if len(scan_files) == 1:
+            scan_tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            scan_tmp.close()
+            scan_files[0].save(scan_tmp.name)
+            scan_path = scan_tmp.name
+        else:
+            partes = []
+            for sf in scan_files:
+                tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+                tmp.close()
+                sf.save(tmp.name)
+                partes.append(tmp.name)
+            scan_path = _mesclar_pdfs(partes)
+            for p in partes:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
         alunos_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         alunos_tmp.close()
@@ -137,6 +168,12 @@ def rota_processar():
         if not periodo_semana:
             return jsonify({"erro": "Informe o período da semana (ex: 05/05 a 09/05)"}), 400
 
+        try:
+            pagina_inicial = int(request.form.get("pagina_inicial", "").strip() or 1)
+        except ValueError:
+            pagina_inicial = 1
+        pagina_inicial = max(1, pagina_inicial)
+
         # Limpa scan anterior se houver
         old_scan = app.config.get("ULTIMO_SCAN")
         if old_scan and os.path.exists(old_scan):
@@ -146,9 +183,9 @@ def rota_processar():
                 pass
 
         # Processa
-        paginas = carregar_todas_paginas(scan_tmp.name, dpi=config["scan"]["dpi"])
+        paginas = carregar_todas_paginas(scan_path, dpi=config["scan"]["dpi"])
         resultados, pags_alinhadas, binarios, resultados_por_pag = processar_pdf_completo(
-            paginas, config, retornar_imagens=True
+            paginas, config, retornar_imagens=True, pagina_inicial=pagina_inicial
         )
         alunos = ler_nomes_alunos(alunos_tmp.name, restaurante["aba"])
 
@@ -204,7 +241,7 @@ def rota_processar():
         # Guarda caminho pra download e dados de preview
         app.config["ULTIMO_RESULTADO"] = saida_tmp.name
         app.config["ULTIMO_NOME"] = f"presencas_{restaurante_key}.xlsx"
-        app.config["ULTIMO_SCAN"] = scan_tmp.name
+        app.config["ULTIMO_SCAN"] = scan_path
         app.config["ULTIMO_CONFIG"] = config
         app.config["REVISAO_DATA"] = {
             "paginas_alinhadas": pags_alinhadas,
@@ -373,7 +410,20 @@ def rota_aplicar_correcoes():
         exportar_xlsx(contagem, dados["alunos"], dados["dias"], saida_tmp.name)
         app.config["ULTIMO_RESULTADO"] = saida_tmp.name
         app.config["ULTIMO_NOME"] = f"presencas_{dados['restaurante_key']}.xlsx"
-        return jsonify({"sucesso": True})
+
+        periodo = app.config.get("ULTIMO_PERIODO")
+        sheets_resp = {}
+        if periodo:
+            try:
+                resultado_sheets = exportar_para_sheets(
+                    contagem, dados["alunos"], dados["dias"],
+                    dados["restaurante_key"], periodo, forcar=True,
+                )
+                sheets_resp = resultado_sheets
+            except Exception:
+                pass
+
+        return jsonify({"sucesso": True, **sheets_resp})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"erro": str(e)}), 500
@@ -585,6 +635,72 @@ body {
 .file-remove { font-size: 12px; color: #e55; cursor: pointer; }
 .file-remove:hover { text-decoration: underline; }
 
+.scan-parte-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #f0f0ee;
+    border-radius: 8px;
+    margin-bottom: 6px;
+}
+.scan-parte-num {
+    width: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #aaa;
+    text-align: right;
+    flex-shrink: 0;
+}
+.scan-parte-icon {
+    width: 30px; height: 30px;
+    border-radius: 6px;
+    background: #eff6ff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; color: #2563eb;
+    flex-shrink: 0;
+}
+.scan-parte-name {
+    flex: 1;
+    font-size: 13px;
+    color: #333;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.scan-parte-acoes { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
+.scan-ord-btn {
+    border: 1px solid #ddd;
+    background: #fff;
+    border-radius: 5px;
+    width: 24px; height: 24px;
+    font-size: 12px;
+    cursor: pointer;
+    color: #555;
+    padding: 0;
+    display: flex; align-items: center; justify-content: center;
+}
+.scan-ord-btn:hover:not(:disabled) { background: #f0f0ee; }
+.scan-ord-btn:disabled { opacity: 0.35; cursor: default; }
+.scan-parte-remove {
+    border: none;
+    background: none;
+    font-size: 13px;
+    color: #e55;
+    cursor: pointer;
+    padding: 0 2px;
+    line-height: 1;
+}
+.scan-parte-remove:hover { color: #c00; }
+.scan-partes-merge-hint {
+    font-size: 12px;
+    color: #2563eb;
+    background: #eff6ff;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-top: 4px;
+}
+
 .btn {
     width: 100%;
     padding: 12px;
@@ -777,9 +893,24 @@ body {
 <body>
 
 <div class="container">
-    <div class="header">
-        <h1>Sistema de presença</h1>
-        <p>Programa Canela — PROAE/UFBA</p>
+    <div class="header" style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;">
+        <div>
+            <h1>Sistema de presença</h1>
+            <p>Programa Canela — PROAE/UFBA</p>
+        </div>
+        <a href="http://localhost:5001" target="_blank"
+           style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;
+                  border-radius:8px;border:1px solid #e5e5e3;background:#fff;
+                  font-size:13px;color:#555;text-decoration:none;white-space:nowrap;
+                  font-family:inherit;transition:all .15s;"
+           onmouseover="this.style.borderColor='#2563eb';this.style.color='#2563eb';"
+           onmouseout="this.style.borderColor='#e5e5e3';this.style.color='#555';">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                <rect x="3" y="14" width="7" height="7"/><circle cx="17.5" cy="17.5" r="3.5"/>
+            </svg>
+            Painel de irregulares
+        </a>
     </div>
 
     <div class="tabs">
@@ -902,19 +1033,16 @@ body {
 
             <div class="section">
                 <div class="label">Scan escaneado (.pdf)</div>
-                <div id="upload-scan-zone" class="upload-zone">
-                    <input type="file" name="scan" accept=".pdf" onchange="fileSelected(this, 'scan')">
+                <div id="upload-scan-zone" class="upload-zone" ondragover="event.preventDefault()" ondrop="onScanDrop(event)">
+                    <input type="file" accept=".pdf" multiple onchange="onScanSelected(this)">
                     <div class="upload-icon">
                         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
                     </div>
-                    <div class="upload-text">Arraste o arquivo ou clique para selecionar</div>
-                    <div class="upload-hint">.pdf escaneado</div>
+                    <div class="upload-text" id="scan-zone-text">Arraste o arquivo ou clique para selecionar</div>
+                    <div class="upload-hint">.pdf escaneado · selecione vários para mesclar em ordem</div>
                 </div>
-                <div id="file-scan" class="file-pill" style="display:none;">
-                    <div class="file-icon">PDF</div>
-                    <div class="file-name" id="file-scan-name"></div>
-                    <div class="file-remove" onclick="removeFile('scan')">remover</div>
-                </div>
+                <div id="scan-partes-lista" style="display:none;margin-top:8px;"></div>
+                <div id="scan-partes-info" style="font-size:12px;color:#888;margin-top:6px;"></div>
             </div>
 
             <div class="section">
@@ -938,6 +1066,12 @@ body {
                 <div class="label">Período da semana <span style="font-weight:400;color:#aaa">(ex: 05/05 a 09/05)</span></div>
                 <input type="text" name="periodo_semana" placeholder="05/05 a 09/05"
                        style="width:200px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
+            </div>
+
+            <div class="section">
+                <div class="label">Página inicial do scan <span style="font-weight:400;color:#aaa">(só preencha se NÃO começar na página 1 do lote impresso)</span></div>
+                <input type="number" name="pagina_inicial" min="1" value="1" placeholder="1"
+                       style="width:100px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
             </div>
 
             <button type="submit" class="btn" id="btn-processar">Processar presenças</button>
@@ -1030,6 +1164,85 @@ function toggleDiaEspecial(el) {
     el.classList.toggle('selected');
 }
 
+// --- Scan multi-parte ---
+var scanFiles = [];
+
+function onScanSelected(input) {
+    for (var i = 0; i < input.files.length; i++) {
+        scanFiles.push(input.files[i]);
+    }
+    input.value = '';
+    renderScanLista();
+}
+
+function onScanDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('upload-scan-zone').classList.remove('dragover');
+    var files = e.dataTransfer.files;
+    for (var i = 0; i < files.length; i++) {
+        if (files[i].type === 'application/pdf' || files[i].name.endsWith('.pdf')) {
+            scanFiles.push(files[i]);
+        }
+    }
+    renderScanLista();
+}
+
+function removeScanParte(idx) {
+    scanFiles.splice(idx, 1);
+    renderScanLista();
+}
+
+function moverScanParte(idx, dir) {
+    var novo = idx + dir;
+    if (novo < 0 || novo >= scanFiles.length) return;
+    var tmp = scanFiles[idx];
+    scanFiles[idx] = scanFiles[novo];
+    scanFiles[novo] = tmp;
+    renderScanLista();
+}
+
+function renderScanLista() {
+    var lista = document.getElementById('scan-partes-lista');
+    var info = document.getElementById('scan-partes-info');
+    var zoneText = document.getElementById('scan-zone-text');
+
+    if (scanFiles.length === 0) {
+        lista.style.display = 'none';
+        lista.innerHTML = '';
+        info.textContent = '';
+        zoneText.textContent = 'Arraste o arquivo ou clique para selecionar';
+        return;
+    }
+
+    zoneText.textContent = scanFiles.length > 1 ? '+ Adicionar mais uma parte' : '+ Adicionar outra parte';
+
+    var html = '';
+    for (var i = 0; i < scanFiles.length; i++) {
+        var isFirst = i === 0;
+        var isLast = i === scanFiles.length - 1;
+        var n = i;
+        html += '<div class="scan-parte-item">' +
+            '<span class="scan-parte-num">' + (i + 1) + '</span>' +
+            '<span class="scan-parte-icon">PDF</span>' +
+            '<span class="scan-parte-name">' + scanFiles[i].name + '</span>' +
+            '<div class="scan-parte-acoes">' +
+            (scanFiles.length > 1 ? '<button type="button" class="scan-ord-btn" onclick="moverScanParte(' + n + ',-1)"' + (isFirst ? ' disabled' : '') + '>↑</button>' +
+             '<button type="button" class="scan-ord-btn" onclick="moverScanParte(' + n + ',1)"' + (isLast ? ' disabled' : '') + '>↓</button>' : '') +
+            '<button type="button" class="scan-parte-remove" onclick="removeScanParte(' + n + ')">✕</button>' +
+            '</div></div>';
+    }
+
+    if (scanFiles.length > 1) {
+        html += '<div class="scan-partes-merge-hint">As ' + scanFiles.length + ' partes serão mescladas em ordem antes do processamento</div>';
+    }
+
+    lista.innerHTML = html;
+    lista.style.display = 'block';
+    info.textContent = '';
+}
+// --- fim scan multi-parte ---
+
 function fileSelected(input, tipo) {
     if (!input.files.length) return;
     var file = input.files[0];
@@ -1119,17 +1332,18 @@ function submitProcessar(e) {
     var data = new FormData();
     data.set('restaurante', form.querySelector('input[name="rest-processar"]:checked').value);
 
-    var scan = form.querySelector('input[name="scan"]');
     var alunos = form.querySelector('input[name="alunos"]');
     var periodo = form.querySelector('input[name="periodo_semana"]').value.trim();
+    var paginaInicial = form.querySelector('input[name="pagina_inicial"]').value.trim();
 
-    if (!scan.files.length) { showError('processar', 'Selecione o PDF do scan.'); return false; }
+    if (!scanFiles.length) { showError('processar', 'Selecione o PDF do scan.'); return false; }
     if (!alunos.files.length) { showError('processar', 'Selecione a planilha de alunos.'); return false; }
     if (!periodo) { showError('processar', 'Informe o período da semana (ex: 05/05 a 09/05).'); return false; }
 
-    data.set('scan', scan.files[0]);
+    scanFiles.forEach(function(f) { data.append('scan', f); });
     data.set('alunos', alunos.files[0]);
     data.set('periodo_semana', periodo);
+    data.set('pagina_inicial', paginaInicial || '1');
 
     showLoading('processar', true);
     hideError('processar');
@@ -1276,8 +1490,8 @@ function substituirSemana() {
         });
 }
 
-// Drag and drop
-document.querySelectorAll('.upload-zone').forEach(function(zone) {
+// Drag and drop — exclui a zona do scan (que tem handler próprio via ondrop)
+document.querySelectorAll('.upload-zone:not(#upload-scan-zone)').forEach(function(zone) {
     zone.addEventListener('dragover', function(e) {
         e.preventDefault();
         zone.classList.add('dragover');
@@ -1292,6 +1506,15 @@ document.querySelectorAll('.upload-zone').forEach(function(zone) {
         input.files = e.dataTransfer.files;
         input.dispatchEvent(new Event('change'));
     });
+});
+
+// Drag visual (hover) para a zona do scan
+document.getElementById('upload-scan-zone').addEventListener('dragover', function(e) {
+    e.preventDefault();
+    this.classList.add('dragover');
+});
+document.getElementById('upload-scan-zone').addEventListener('dragleave', function() {
+    this.classList.remove('dragover');
 });
 </script>
 

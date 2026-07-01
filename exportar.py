@@ -172,7 +172,7 @@ def _detectar_numero_pagina(alinhada: np.ndarray, config: dict):
 
 # --- PROCESSAMENTO COMPLETO ---
 
-def processar_pdf_completo(paginas, config, retornar_imagens=False):
+def processar_pdf_completo(paginas, config, retornar_imagens=False, pagina_inicial=1):
     """
     Processa todas as páginas do scan:
     1. Pula páginas em branco
@@ -182,13 +182,19 @@ def processar_pdf_completo(paginas, config, retornar_imagens=False):
 
     A reordenação automática corrige casos em que o scanner embaralha as folhas
     durante o scan em massa. Se o OCR não estiver disponível (pytesseract não
-    instalado), as páginas são processadas na ordem do scan.
+    instalado), as páginas são processadas na ordem do scan, numeradas a partir
+    de `pagina_inicial` — sem isso, um scan que começa na página 2 do lote
+    impresso seria erroneamente tratado como página 1 (puxando os nomes/alunos
+    errados da planilha).
 
     Args:
         paginas: lista de imagens BGR
         config: dict do config.yaml
         retornar_imagens: se True, retorna também (paginas_alinhadas, binarios,
             resultados_por_pagina) para uso no fluxo de revisão.
+        pagina_inicial: número da página impressa em que a 1ª página do scan
+            começa. Só importa quando o OCR de número de página não está
+            disponível/falha; nesse caso é a base da numeração sequencial.
 
     Returns:
         Se retornar_imagens=False: lista de resultados por aluno
@@ -266,10 +272,11 @@ def processar_pdf_completo(paginas, config, retornar_imagens=False):
             print(f"  Para reordenamento automático: pip install pytesseract + instalar Tesseract-OCR")
         else:
             print(f"\n  AVISO: número detectado em {n_det}/{len(paginas_brutas)} páginas — mantendo ordem do scan.")
+        print(f"  Numerando a partir da página {pagina_inicial} do lote impresso.")
 
     # Atribuir numeração global de aluno com base na ordem correta
     for idx, p in enumerate(paginas_brutas):
-        pagina_template = p["num_detectado"] if todos_detectados else (1 + idx)
+        pagina_template = p["num_detectado"] if todos_detectados else (pagina_inicial + idx)
 
         for r in p["resultados"]:
             r["numero"] = (pagina_template - 1) * alunos_por_pagina + r["numero"]

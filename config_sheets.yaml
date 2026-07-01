@@ -30,3 +30,24 @@ restaurantes:
     spreadsheet_id: ""
 
 dashboard_spreadsheet_id: "1d4SfVWnG8iwk90jGnPIj7U6bPG5nriA5F2b-6pvSt60"
+
+# Módulo de justificativas — respostas do Google Forms
+# Deixe spreadsheet_id vazio para desativar o módulo.
+#
+# Como configurar:
+#   1. Crie um Google Form com campos de Matrícula, Nome, Período e Justificativa
+#   2. Em "Respostas" → vincule a uma planilha Google Sheets
+#   3. Compartilhe essa planilha com o client_email das credenciais (permissão Leitor)
+#   4. Cole o ID da planilha abaixo (URL: /spreadsheets/d/<ID>/edit)
+#   5. Ajuste os nomes das colunas conforme os títulos das perguntas do seu formulário
+formulario_justificativas:
+  spreadsheet_id: "1NcZvxxhRVHouQ6HQ8Smq9fU8vtAWkNjc5us9gEn9BcY"
+  coluna_timestamp: "Carimbo de data/hora"
+  coluna_nome: "Nome completo"
+  coluna_matricula: "Matrícula"
+  coluna_local: "Local de Refeição"
+  coluna_datas: "Datas de ausência"
+  coluna_comprovante: "Comprovante de Ausência"
+  coluna_parecer: "Parecer"
+  coluna_contabilizado: "Contabilizado"
+  coluna_comentario: "Comentário (Se negado )"

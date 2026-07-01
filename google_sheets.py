@@ -309,60 +309,181 @@ def _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, num_dias, num_a
     spreadsheet.batch_update({"requests": requests})
 
 
-def _formatar_colunas_fixas(spreadsheet, aba, num_alunos):
-    """Formata Nº/Nome/Mat e congela primeiras 2 linhas e 3 colunas (roda uma vez por aba)."""
-    sheet_id = aba.id
-    r_fim = 2 + num_alunos
-    borda = {"style": "SOLID", "width": 1, "color": _COR_BORDA}
+# Restaurantes FDS não têm planilha própria: usam a planilha do restaurante pai
+# e mesclam os dados no bloco da semana já existente.
+# FDS especial = feriado emendado com dias customizáveis (ex: Qui+Sex+Sab).
+_RESTAURANTE_PAI = {
+    "canela_fds":           "canela",
+    "sao_lazaro_fds":       "sao_lazaro",
+    "canela_fds_especial":  "canela",
+    "sao_lazaro_fds_especial": "sao_lazaro",
+}
 
-    requests = [
-        {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 2,
-                      "startColumnIndex": 0, "endColumnIndex": _COL_FIXAS},
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": _COR_CABECALHO,
-                "textFormat": {"bold": True, "fontSize": 10},
-                "horizontalAlignment": "CENTER",
-            }},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
-        }},
-        {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": 2, "endRowIndex": r_fim,
-                      "startColumnIndex": 1, "endColumnIndex": 2},
-            "cell": {"userEnteredFormat": {"horizontalAlignment": "LEFT"}},
-            "fields": "userEnteredFormat(horizontalAlignment)",
-        }},
-        {"updateBorders": {
-            "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": r_fim,
-                      "startColumnIndex": 0, "endColumnIndex": _COL_FIXAS},
-            "top": borda, "bottom": borda, "left": borda, "right": borda,
-            "innerHorizontal": borda, "innerVertical": borda,
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 0, "endIndex": 1},
-            "properties": {"pixelSize": 45}, "fields": "pixelSize",
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 1, "endIndex": 2},
-            "properties": {"pixelSize": 220}, "fields": "pixelSize",
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 2, "endIndex": 3},
-            "properties": {"pixelSize": 105}, "fields": "pixelSize",
-        }},
-        {"updateSheetProperties": {
-            "properties": {
-                "sheetId": sheet_id,
-                "gridProperties": {"frozenRowCount": 2, "frozenColumnCount": _COL_FIXAS},
-            },
-            "fields": "gridProperties(frozenRowCount,frozenColumnCount)",
-        }},
-    ]
 
-    spreadsheet.batch_update({"requests": requests})
+def _mesclar_fds_no_bloco(aba, inicio_1idx, contagem_fds, dias_fds):
+    """
+    Adiciona dados do FDS ao bloco da semana já existente.
+
+    Suporta múltiplos dias (ex: FDS especial = ["Quinta", "Sexta", "Sábado"]).
+    - Dias já presentes no header (mesmo vindos do template de semana) são
+      reutilizados; dias novos são adicionados após a última coluna.
+    - Incrementa "Presenças" com o total de dias FDS presentes por aluno.
+    """
+    import gspread as _gs
+
+    valores = aba.get_all_values()
+
+    # header está no índice 0-based = inicio_1idx (marcador é inicio_1idx - 1)
+    header_0idx = inicio_1idx
+    header_row_1idx = inicio_1idx + 1
+    data_start_0idx = inicio_1idx + 1
+
+    if header_0idx >= len(valores):
+        return
+
+    header = valores[header_0idx]
+
+    # Mapeia cada dia FDS para a coluna no header (existente ou nova)
+    dia_cols = {}   # dia -> col_0idx
+    novos_dias = [] # dias que precisam de nova coluna no cabeçalho
+
+    ultimo_col_alocado = max((j for j, h in enumerate(header) if h.strip()), default=3)
+
+    for dia in dias_fds:
+        col = None
+        for j, h in enumerate(header):
+            if h.strip() == dia:
+                col = j
+                break
+        if col is None:
+            ultimo_col_alocado += 1
+            col = ultimo_col_alocado
+            novos_dias.append(dia)
+        dia_cols[dia] = col
+
+    col_presencas_0idx = 3
+    fds_map = {c["numero"]: c for c in contagem_fds}
+    updates = []
+
+    for dia in novos_dias:
+        updates.append({
+            "range": _gs.utils.rowcol_to_a1(header_row_1idx, dia_cols[dia] + 1),
+            "values": [[dia]],
+        })
+
+    for row_0idx in range(data_start_0idx, len(valores)):
+        row = valores[row_0idx]
+        if not any(cell.strip() for cell in row):
+            break
+
+        try:
+            num = int(row[0])
+        except (ValueError, IndexError):
+            continue
+
+        c = fds_map.get(num)
+        if not c:
+            continue
+
+        sheet_row_1idx = row_0idx + 1
+
+        try:
+            presencas_atuais = (
+                int(row[col_presencas_0idx])
+                if col_presencas_0idx < len(row) and row[col_presencas_0idx].strip()
+                else 0
+            )
+        except ValueError:
+            presencas_atuais = 0
+
+        updates.append({
+            "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, col_presencas_0idx + 1),
+            "values": [[presencas_atuais + c["presencas"]]],
+        })
+
+        for dia in dias_fds:
+            d = c["detalhes"].get(dia, {})
+            marcas = ("A" if d.get("almoco") else "") + ("J" if d.get("janta") else "")
+            updates.append({
+                "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, dia_cols[dia] + 1),
+                "values": [[marcas]],
+            })
+
+    if updates:
+        aba.batch_update(updates, value_input_option="USER_ENTERED")
+
+
+def _desfazer_fds_do_bloco(aba, inicio_1idx, dias_fds):
+    """
+    Desfaz a mesclagem FDS de um bloco (para permitir re-exportação forçada).
+
+    Suporta múltiplos dias: decrementa "Presenças" pelo número de dias FDS que
+    tinham marcação e limpa as células correspondentes.
+    """
+    import gspread as _gs
+
+    valores = aba.get_all_values()
+    header_0idx = inicio_1idx
+    data_start_0idx = inicio_1idx + 1
+
+    if header_0idx >= len(valores):
+        return
+
+    header = valores[header_0idx]
+
+    # Localiza colunas para cada dia FDS
+    dia_cols = {}
+    for dia in dias_fds:
+        for j, h in enumerate(header):
+            if h.strip() == dia:
+                dia_cols[dia] = j
+                break
+
+    if not dia_cols:
+        return
+
+    col_presencas_0idx = 3
+    updates = []
+
+    for row_0idx in range(data_start_0idx, len(valores)):
+        row = valores[row_0idx]
+        if not any(cell.strip() for cell in row):
+            break
+
+        sheet_row_1idx = row_0idx + 1
+
+        # Conta quantos dias FDS tinham marcação nesta linha
+        dias_tinha = sum(
+            1 for col in dia_cols.values()
+            if col < len(row) and row[col].strip()
+        )
+
+        if dias_tinha == 0:
+            continue
+
+        try:
+            presencas_atuais = (
+                int(row[col_presencas_0idx])
+                if col_presencas_0idx < len(row) and row[col_presencas_0idx].strip()
+                else dias_tinha
+            )
+        except ValueError:
+            presencas_atuais = dias_tinha
+
+        updates.append({
+            "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, col_presencas_0idx + 1),
+            "values": [[max(0, presencas_atuais - dias_tinha)]],
+        })
+
+        for col in dia_cols.values():
+            if col < len(row) and row[col].strip():
+                updates.append({
+                    "range": _gs.utils.rowcol_to_a1(sheet_row_1idx, col + 1),
+                    "values": [[""]],
+                })
+
+    if updates:
+        aba.batch_update(updates, value_input_option="USER_ENTERED")
 
 
 _DIA_SEMANA_PT = {
@@ -383,6 +504,7 @@ _UNIDADE_LEGIVEL = {
     "sao_lazaro_fds":            "São Lázaro",
     "canela_fds_especial":       "Canela",
     "sao_lazaro_fds_especial":   "São Lázaro",
+    "ondina_fds_especial":       "Ondina",
 }
 
 _HEADERS_PRESENCAS = [

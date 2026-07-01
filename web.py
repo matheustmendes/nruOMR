@@ -82,6 +82,11 @@ RESTAURANTES = {
         "aba": "PDSL FDS",
         "config": "config_sao_lazaro_fds_especial.yaml",
     },
+    "ondina_fds_especial": {
+        "nome": "Ondina Especial",
+        "aba": "ONDINA IMPRESSÃO",
+        "config": "config_ondina_fds_especial.yaml",
+    },
 }
 
 
@@ -301,8 +306,21 @@ def rota_gerar_template():
                     info["restaurante"] = rest["nome"]
                 if data_periodo:
                     info["datas"] = data_periodo
+                    try:
+                        from datetime import datetime as _dt
+                        _MESES_PT = [
+                            "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                            "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+                        ]
+                        _parte = data_periodo.split(" a ")[0].strip()
+                        _mes = int(_parte.split("/")[1])
+                        _hoje = _dt.now()
+                        _ano = _hoje.year if _mes <= _hoje.month else _hoje.year - 1
+                        info["mes_ano"] = f"{_MESES_PT[_mes - 1]} {_ano}"
+                    except Exception:
+                        pass
 
-                if key in ("canela_fds_especial", "sao_lazaro_fds_especial"):
+                if key in ("canela_fds_especial", "sao_lazaro_fds_especial", "ondina_fds_especial"):
                     dias_str = request.form.get("dias_especial", "")
                     dias = [d.strip() for d in dias_str.split(",") if d.strip()]
                     if not dias:
@@ -946,6 +964,9 @@ body {
                         <input type="radio" name="rest-template" value="sao_lazaro_fds_especial"> S. Lázaro FDS Esp.
                     </label>
                     <label class="radio" onclick="selectRadio(this, 'rest-template')">
+                        <input type="radio" name="rest-template" value="ondina_fds_especial"> Ondina Esp.
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-template')">
                         <input type="radio" name="rest-template" value="todos"> Todos
                     </label>
                 </div>
@@ -1027,6 +1048,9 @@ body {
                     </label>
                     <label class="radio" onclick="selectRadio(this, 'rest-processar')">
                         <input type="radio" name="rest-processar" value="sao_lazaro_fds_especial"> S. Lázaro FDS Esp.
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                        <input type="radio" name="rest-processar" value="ondina_fds_especial"> Ondina Esp.
                     </label>
                 </div>
             </div>
@@ -1152,7 +1176,7 @@ function selectRadio(el, name) {
 
     if (name === 'rest-template') {
         var val = el.querySelector('input').value;
-        var isFdsEsp = val === 'canela_fds_especial' || val === 'sao_lazaro_fds_especial';
+        var isFdsEsp = val === 'canela_fds_especial' || val === 'sao_lazaro_fds_especial' || val === 'ondina_fds_especial';
         document.getElementById('dias-especial-section').style.display = isFdsEsp ? '' : 'none';
         if (!isFdsEsp) {
             document.querySelectorAll('#dias-especial-group .radio').forEach(function(d) { d.classList.remove('selected'); });

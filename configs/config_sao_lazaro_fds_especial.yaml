@@ -30,7 +30,6 @@ layout:
   dias:
   - Quinta
   - Sexta
-  - Sábado
   circulos_por_dia:
     Quinta:
       almoco_x: 105.0
@@ -38,7 +37,4 @@ layout:
     Sexta:
       almoco_x: 122.0
       janta_x: 130.0
-    Sábado:
-      almoco_x: 139.0
-      janta_x: 147.0
 restaurante: SÃO LÁZARO

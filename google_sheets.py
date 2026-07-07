@@ -3,13 +3,21 @@ google_sheets.py
 
 Exporta resultados de presença para Google Sheets.
 
-Estrutura da aba mensal (ex: "Maio 2026") — layout horizontal:
-    Row 1: (vazio) | (vazio) | (vazio) | Período: 05/05 a 09/05 | ... | Período: 12/05 a 16/05 | ...
-    Row 2: Nº | Nome | Matrícula | Presenças | Seg | Ter | Qua | Qui | Sex | Presenças | Seg | ...
-    Row 3+: 1 | João | 123456 | 3 | AJ | | A | | J | 4 | A | AJ | ...
+Configuração em config_sheets.yaml:
+    credentials: credentials_sheets.json
+    restaurantes:
+      canela:
+        spreadsheet_id: "1abc..."
+      ondina:
+        spreadsheet_id: "1def..."
+      sao_lazaro:
+        spreadsheet_id: "1ghi..."
 
-Cada semana/período vira um grupo de colunas. Rows 1 e 2 são congeladas para
-scroll horizontal. Colunas Nº/Nome/Mat são fixas (frozen).
+Estrutura escrita na planilha (aba mensal, ex: "Maio 2026"):
+    Período: 05/05 a 09/05
+    Nº | Nome | Matrícula | Presenças | Seg | Ter | Qua | Qui | Sex
+    1  | João  | 123456   | 3         | AJ  |     | A   |     | J
+    (linha vazia separando semanas)
 """
 
 import os
@@ -86,225 +94,258 @@ def _obter_ou_criar_aba(spreadsheet, nome_aba):
     try:
         return spreadsheet.worksheet(nome_aba)
     except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=nome_aba, rows=600, cols=100)
+        return spreadsheet.add_worksheet(title=nome_aba, rows=500, cols=20)
 
 
 def _marcador_periodo(periodo):
     return f"Período: {periodo}"
 
 
-# --- LAYOUT HORIZONTAL: períodos lado a lado como colunas ---
-# Estrutura da aba mensal:
-#   Row 1: vazia nas cols fixas | "Período: X" (mesclado) | "Período: Y" (mesclado) | ...
-#   Row 2: Nº | Nome | Matrícula | Presenças | Seg | Ter | ... | Presenças | Seg | ...
-#   Row 3+: uma linha por aluno, permanente durante o mês
-#
-# FDS recebe bloco próprio (não mescla no período de semana) usando a planilha
-# do restaurante pai (ex: canela_fds → planilha de canela).
-
-# Restaurantes FDS usam a planilha do restaurante pai.
-_RESTAURANTE_PAI = {
-    "canela_fds":              "canela",
-    "sao_lazaro_fds":          "sao_lazaro",
-    "canela_fds_especial":     "canela",
-    "sao_lazaro_fds_especial": "sao_lazaro",
-}
-
-_COL_FIXAS = 3  # Nº, Nome, Matrícula
-
-
-def _encontrar_col_periodo(valores, periodo):
-    """Retorna índice 0-based da coluna onde o período aparece em row 1, ou None."""
-    if not valores:
-        return None
+def _localizar_bloco(aba, periodo):
+    """
+    Retorna (linha_inicio, linha_fim) 1-indexed se o período já existe,
+    ou None. O range inclui a linha vazia separadora se presente.
+    """
     marcador = _marcador_periodo(periodo)
-    for j, v in enumerate(valores[0]):
-        if str(v).strip() == marcador:
-            return j
-    return None
+    valores = aba.get_all_values()
+
+    inicio = None
+    for i, row in enumerate(valores):
+        if row and row[0] == marcador:
+            inicio = i + 1  # converte para 1-indexed
+            break
+
+    if inicio is None:
+        return None
+
+    # Encontra fim do bloco: próxima linha vazia ou fim da planilha
+    fim = inicio
+    for i in range(inicio, len(valores)):  # i é 0-indexed
+        if not any(valores[i]):
+            fim = i + 1  # inclui a linha vazia, 1-indexed
+            break
+        fim = i + 1
+
+    return (inicio, fim)
 
 
-def _proxima_col_periodo(valores):
-    """Retorna índice 0-based da próxima coluna disponível para novo período."""
-    if not valores:
-        return _COL_FIXAS
-    max_j = _COL_FIXAS - 1
-    for row in valores:
-        for j in range(len(row) - 1, -1, -1):
-            if j < len(row) and str(row[j]).strip():
-                if j > max_j:
-                    max_j = j
-                break
-    return max_j + 1
-
-
-def _montar_row_dados(c, dias):
-    """Monta [presencas, mark_dia1, mark_dia2, ...] para as colunas do período."""
-    if not c:
-        return [0] + [""] * len(dias)
-    row = [c["presencas"]]
-    for dia in dias:
-        d = c["detalhes"].get(dia, {})
-        if d.get("presente"):
-            row.append(("A" if d.get("almoco") else "") + ("J" if d.get("janta") else ""))
-        else:
-            row.append("")
-    return row
-
-
-def _escrever_periodo_horizontal(aba, valores, contagem, alunos, dias, periodo, col_inicio):
+def _localizar_bloco_semana_fds(aba, periodo_fds):
     """
-    Escreve (ou sobrescreve) as colunas de um período.
-    Se a aba não tem linhas de alunos ainda, também inicializa Nº/Nome/Mat.
+    Para FDS: encontra o bloco de dias úteis da mesma semana, mesmo que o
+    período FDS ("10/05 a 10/05") não coincida exatamente com o da semana
+    ("05/05 a 09/05"). Aceita blocos cujo início seja 0-6 dias antes do FDS.
     """
-    import gspread as _gs
+    from datetime import datetime
 
-    num_cols = 1 + len(dias)
-    eh_nova = len(valores) < 3 or not any(
-        str(r[0]).strip() for r in valores[2:] if r
-    )
-    aluno_map = {c["numero"]: c for c in contagem}
-    updates = []
+    try:
+        parte = periodo_fds.split(" a ")[0].strip()
+        dd, mm = parte.split("/")
+        hoje = datetime.now()
+        ano = hoje.year if int(mm) <= hoje.month else hoje.year - 1
+        data_fds = datetime(ano, int(mm), int(dd))
+    except Exception:
+        return None
 
-    # Row 1: marcador de período
-    updates.append({
-        "range": _gs.utils.rowcol_to_a1(1, col_inicio + 1),
-        "values": [[_marcador_periodo(periodo)]],
-    })
+    valores = aba.get_all_values()
+    melhor = None  # (inicio_1idx, diff_dias)
 
-    if eh_nova:
-        # Row 2: cabeçalhos fixos + sub-headers do período em uma única linha
-        cabecalho = (
-            ["Nº", "Nome", "Matrícula"]
-            + [""] * (col_inicio - _COL_FIXAS)
-            + ["Presenças"] + list(dias)
-        )
-        updates.append({"range": "A2", "values": [cabecalho]})
+    for i, row in enumerate(valores):
+        if not (row and row[0].startswith("Período: ")):
+            continue
+        periodo_str = row[0][len("Período: "):]
+        try:
+            parte2 = periodo_str.split(" a ")[0].strip()
+            dd2, mm2 = parte2.split("/")
+            # Mesmo ano ou anterior se o mês do bloco for maior que o mês FDS
+            ano2 = ano if int(mm2) <= int(mm) else ano - 1
+            data_ini = datetime(ano2, int(mm2), int(dd2))
+            diff = (data_fds - data_ini).days
+            if 0 <= diff <= 6:
+                if melhor is None or diff < melhor[1]:
+                    melhor = (i + 1, diff)
+        except Exception:
+            continue
 
-        # Rows 3+: dados completos de cada aluno
-        for i, (nome, mat) in enumerate(alunos):
-            num = i + 1
-            row_data = _montar_row_dados(aluno_map.get(num), dias)
-            sheet_row = num + 2
-            linha = [num, nome, mat] + [""] * (col_inicio - _COL_FIXAS) + row_data
-            updates.append({"range": f"A{sheet_row}", "values": [linha]})
-    else:
-        # Row 2: apenas sub-headers do novo período
-        updates.append({
-            "range": (
-                f"{_gs.utils.rowcol_to_a1(2, col_inicio + 1)}"
-                f":{_gs.utils.rowcol_to_a1(2, col_inicio + num_cols)}"
-            ),
-            "values": [["Presenças"] + list(dias)],
-        })
+    if melhor is None:
+        return None
 
-        # Rows 3+: atualiza dados nas colunas do período para alunos existentes
-        for row_idx in range(2, len(valores)):
-            row = valores[row_idx]
-            if not row or not str(row[0]).strip():
-                continue
-            try:
-                num = int(str(row[0]).strip())
-            except ValueError:
-                continue
-            row_data = _montar_row_dados(aluno_map.get(num), dias)
-            sheet_row = row_idx + 1
-            updates.append({
-                "range": (
-                    f"{_gs.utils.rowcol_to_a1(sheet_row, col_inicio + 1)}"
-                    f":{_gs.utils.rowcol_to_a1(sheet_row, col_inicio + num_cols)}"
-                ),
-                "values": [row_data],
-            })
+    inicio_1idx = melhor[0]
+    fim = inicio_1idx
+    for i in range(inicio_1idx, len(valores)):
+        if not any(valores[i]):
+            fim = i + 1
+            break
+        fim = i + 1
 
-    aba.batch_update(updates, value_input_option="USER_ENTERED")
+    return (inicio_1idx, fim)
 
 
-def _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, num_dias, num_alunos):
-    """Formata as colunas do período recém-adicionado via Sheets API v4."""
+def _construir_bloco(contagem, alunos, dias, periodo):
+    linhas = []
+    linhas.append([_marcador_periodo(periodo)])
+    linhas.append(["Nº", "Nome", "Matrícula", "Presenças"] + list(dias))
+
+    for c in contagem:
+        idx = c["numero"] - 1
+        nome, matricula = (alunos[idx] if 0 <= idx < len(alunos)
+                           else (f"Aluno {c['numero']}", ""))
+        linha = [c["numero"], nome, matricula, c["presencas"]]
+        for dia in dias:
+            d = c["detalhes"][dia]
+            if d["presente"]:
+                marcas = ("A" if d["almoco"] else "") + ("J" if d["janta"] else "")
+                linha.append(marcas)
+            else:
+                linha.append("")
+        linhas.append(linha)
+
+    linhas.append([])  # separador entre semanas
+    return linhas
+
+
+def _ultima_linha_com_dados(aba):
+    """Retorna índice 1-indexed da última linha não vazia, ou 0 se planilha vazia."""
+    valores = aba.get_all_values()
+    for i in range(len(valores) - 1, -1, -1):
+        if any(cell.strip() for cell in valores[i]):
+            return i + 1
+    return 0
+
+
+def _aplicar_formatacao(spreadsheet, aba, linha_inicio_1idx, num_alunos, num_dias):
+    """Aplica formatação profissional ao bloco recém-inserido via Sheets API v4."""
     sheet_id = aba.id
-    num_cols = 1 + num_dias
+    num_colunas = 4 + num_dias
 
-    r_per  = 0      # row 1 (0-indexed): período header
-    r_cab  = 1      # row 2: sub-headers
-    r_ini  = 2      # row 3: início dos dados
-    r_fim  = r_ini + num_alunos
-
-    c0 = col_inicio
-    c1 = col_inicio + num_cols
+    # Índices de linha em 0-indexed para a API
+    r_periodo    = linha_inicio_1idx - 1
+    r_cabecalho  = r_periodo + 1
+    r_dados_ini  = r_cabecalho + 1
+    r_dados_fim  = r_dados_ini + num_alunos  # exclusive
 
     borda = {"style": "SOLID", "width": 1, "color": _COR_BORDA}
 
-    def rng(r0, r1, c_ini=c0, c_fim=c1):
+    def rng(r_ini, r_fim, c_ini=0, c_fim=None):
         return {
             "sheetId": sheet_id,
-            "startRowIndex": r0, "endRowIndex": r1,
-            "startColumnIndex": c_ini, "endColumnIndex": c_fim,
+            "startRowIndex": r_ini,
+            "endRowIndex": r_fim,
+            "startColumnIndex": c_ini,
+            "endColumnIndex": c_fim if c_fim is not None else num_colunas,
         }
 
     requests = [
-        {"mergeCells": {"range": rng(r_per, r_per + 1), "mergeType": "MERGE_ALL"}},
-        {"repeatCell": {
-            "range": rng(r_per, r_per + 1),
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": _COR_TITULO,
-                "textFormat": {"bold": True, "fontSize": 10, "foregroundColor": _BRANCO},
-                "horizontalAlignment": "CENTER",
-                "verticalAlignment": "MIDDLE",
-            }},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)",
-        }},
-        {"repeatCell": {
-            "range": rng(r_cab, r_cab + 1),
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": _COR_CABECALHO,
-                "textFormat": {"bold": True, "fontSize": 10},
-                "horizontalAlignment": "CENTER",
-                "verticalAlignment": "MIDDLE",
-                "wrapStrategy": "WRAP",
-            }},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
-        }},
-        {"repeatCell": {
-            "range": rng(r_ini, r_fim),
-            "cell": {"userEnteredFormat": {
-                "textFormat": {"fontSize": 10},
-                "horizontalAlignment": "CENTER",
-                "verticalAlignment": "MIDDLE",
-            }},
-            "fields": "userEnteredFormat(textFormat,horizontalAlignment,verticalAlignment)",
-        }},
-        {"updateBorders": {
-            "range": rng(r_per, r_fim),
-            "top": borda, "bottom": borda, "left": borda, "right": borda,
-            "innerHorizontal": borda, "innerVertical": borda,
-        }},
-        # Largura coluna Presenças
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": c0, "endIndex": c0 + 1},
-            "properties": {"pixelSize": 75}, "fields": "pixelSize",
-        }},
-        # Altura row período
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                      "startIndex": r_per, "endIndex": r_per + 1},
-            "properties": {"pixelSize": 32}, "fields": "pixelSize",
-        }},
-        # Altura row sub-headers
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "ROWS",
-                      "startIndex": r_cab, "endIndex": r_cab + 1},
-            "properties": {"pixelSize": 28}, "fields": "pixelSize",
-        }},
+        # 1. Mesclar linha do período em todas as colunas
+        {
+            "mergeCells": {
+                "range": rng(r_periodo, r_periodo + 1),
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        # 2. Estilo da linha do período (título azul escuro)
+        {
+            "repeatCell": {
+                "range": rng(r_periodo, r_periodo + 1),
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": _COR_TITULO,
+                    "textFormat": {
+                        "bold": True,
+                        "fontSize": 11,
+                        "foregroundColor": _BRANCO,
+                    },
+                    "horizontalAlignment": "LEFT",
+                    "verticalAlignment": "MIDDLE",
+                    "wrapStrategy": "OVERFLOW_CELL",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
+            }
+        },
+        # 3. Estilo da linha de cabeçalho (azul claro, negrito)
+        {
+            "repeatCell": {
+                "range": rng(r_cabecalho, r_cabecalho + 1),
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": _COR_CABECALHO,
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment": "MIDDLE",
+                    "wrapStrategy": "WRAP",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
+            }
+        },
+        # 4. Estilo geral das linhas de dados
+        {
+            "repeatCell": {
+                "range": rng(r_dados_ini, r_dados_fim),
+                "cell": {"userEnteredFormat": {
+                    "textFormat": {"fontSize": 10},
+                    "verticalAlignment": "MIDDLE",
+                    "horizontalAlignment": "CENTER",
+                    "wrapStrategy": "CLIP",
+                }},
+                "fields": "userEnteredFormat(textFormat,verticalAlignment,horizontalAlignment,wrapStrategy)",
+            }
+        },
+        # 5. Coluna de nomes: alinhado à esquerda
+        {
+            "repeatCell": {
+                "range": rng(r_dados_ini, r_dados_fim, c_ini=1, c_fim=2),
+                "cell": {"userEnteredFormat": {"horizontalAlignment": "LEFT"}},
+                "fields": "userEnteredFormat(horizontalAlignment)",
+            }
+        },
+        # 6. Bordas em todo o bloco (período + cabeçalho + dados)
+        {
+            "updateBorders": {
+                "range": rng(r_periodo, r_dados_fim),
+                "top": borda, "bottom": borda,
+                "left": borda, "right": borda,
+                "innerHorizontal": borda, "innerVertical": borda,
+            }
+        },
+        # 7. Larguras das colunas fixas
+        *[
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                              "startIndex": col, "endIndex": col + 1},
+                    "properties": {"pixelSize": px},
+                    "fields": "pixelSize",
+                }
+            }
+            for col, px in [(0, 45), (1, 220), (2, 105), (3, 80)]
+        ],
+        # 8. Altura da linha do período
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS",
+                          "startIndex": r_periodo, "endIndex": r_periodo + 1},
+                "properties": {"pixelSize": 32},
+                "fields": "pixelSize",
+            }
+        },
+        # 9. Altura da linha de cabeçalho
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS",
+                          "startIndex": r_cabecalho, "endIndex": r_cabecalho + 1},
+                "properties": {"pixelSize": 28},
+                "fields": "pixelSize",
+            }
+        },
     ]
 
+    # 10. Largura das colunas de dias (55 px cada)
     for i in range(num_dias):
-        requests.append({"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": c0 + 1 + i, "endIndex": c0 + 2 + i},
-            "properties": {"pixelSize": 55}, "fields": "pixelSize",
-        }})
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                          "startIndex": 4 + i, "endIndex": 5 + i},
+                "properties": {"pixelSize": 55},
+                "fields": "pixelSize",
+            }
+        })
 
     spreadsheet.batch_update({"requests": requests})
 
@@ -313,10 +354,11 @@ def _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, num_dias, num_a
 # e mesclam os dados no bloco da semana já existente.
 # FDS especial = feriado emendado com dias customizáveis (ex: Qui+Sex+Sab).
 _RESTAURANTE_PAI = {
-    "canela_fds":           "canela",
-    "sao_lazaro_fds":       "sao_lazaro",
-    "canela_fds_especial":  "canela",
+    "canela_fds":              "canela",
+    "sao_lazaro_fds":          "sao_lazaro",
+    "canela_fds_especial":     "canela",
     "sao_lazaro_fds_especial": "sao_lazaro",
+    "ondina_fds_especial":     "ondina",
 }
 
 
@@ -522,23 +564,29 @@ _HEADERS_RESUMO = [
 
 def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forcar=False):
     """
-    Exporta dados de presença para Google Sheets (layout horizontal).
+    Exporta dados de presença para Google Sheets.
 
-    Cada período vira um grupo de colunas lado a lado na aba mensal.
-    Row 1 = marcadores de período; Row 2 = sub-headers; Rows 3+ = alunos.
-    FDS usa a planilha do restaurante pai como bloco standalone.
+    Args:
+        contagem: lista de dicts com presenças (saída de contar_presencas)
+        alunos: lista de (nome, matricula)
+        dias: lista de nomes dos dias
+        restaurante_key: "canela", "ondina" ou "sao_lazaro"
+        periodo: string do período da semana, ex: "05/05 a 09/05"
+        forcar: se True, sobrescreve o bloco existente sem perguntar
 
     Returns:
-        {"ok": True, "aba": "Maio 2026"}
-        {"ok": True, "aba": "...", "aviso_formatacao": "..."}
-        {"ok": False, "duplicado": True, "aba": "..."}
-        {"ok": False, "erro": "mensagem"}
+        dict:
+            {"ok": True, "aba": "Maio 2026"}                          — sucesso
+            {"ok": True, "aba": "...", "aviso_formatacao": "..."}     — dados salvos, formatação falhou
+            {"ok": False, "duplicado": True, "aba": "..."}            — período já existe
+            {"ok": False, "erro": "mensagem"}                         — erro
     """
     try:
         config = _carregar_config()
 
         # FDS usa a planilha do restaurante pai (ex: canela_fds → canela)
         restaurante_efetivo = _RESTAURANTE_PAI.get(restaurante_key, restaurante_key)
+        eh_fds = restaurante_key in _RESTAURANTE_PAI
 
         rest = config.get("restaurantes", {}).get(restaurante_efetivo, {})
         spreadsheet_id = rest.get("spreadsheet_id", "").strip()
@@ -555,25 +603,75 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
         spreadsheet = cliente.open_by_key(spreadsheet_id)
         nome_aba = _nome_aba_mes(periodo)
         aba = _obter_ou_criar_aba(spreadsheet, nome_aba)
-        valores = aba.get_all_values()
 
-        col_existente = _encontrar_col_periodo(valores, periodo)
+        bloco_existente = _localizar_bloco(aba, periodo)
 
-        if col_existente is not None and not forcar:
+        if eh_fds:
+            # Tenta localizar o bloco da semana mesmo quando o período FDS difere
+            # (ex: "10/05 a 10/05" vs "05/05 a 09/05")
+            if bloco_existente is None:
+                bloco_existente = _localizar_bloco_semana_fds(aba, periodo)
+
+            if bloco_existente:
+                inicio, fim = bloco_existente
+                valores = aba.get_all_values()
+                header = valores[inicio] if inicio < len(valores) else []
+                dia_fds_set = set(dias)
+
+                # Verifica dados reais nas colunas FDS — não basta o header existir,
+                # pois no FDS especial (ex: Qui+Sex+Sab) Qui/Sex podem estar no
+                # template de semana mas vazios (feriado).
+                ja_mesclado = False
+                for j, h in enumerate(header):
+                    if h.strip() not in dia_fds_set:
+                        continue
+                    for row_0idx in range(inicio + 1, len(valores)):
+                        row = valores[row_0idx]
+                        if not any(cell.strip() for cell in row):
+                            break
+                        if j < len(row) and row[j].strip():
+                            ja_mesclado = True
+                            break
+                    if ja_mesclado:
+                        break
+
+                if ja_mesclado and not forcar:
+                    return {"ok": False, "duplicado": True, "aba": nome_aba}
+
+                if ja_mesclado and forcar:
+                    _desfazer_fds_do_bloco(aba, inicio, dias)
+
+                _mesclar_fds_no_bloco(aba, inicio, contagem, dias)
+            else:
+                # Bloco da semana ainda não existe: cria um bloco FDS standalone
+                bloco = _construir_bloco(contagem, alunos, dias, periodo)
+                linha_inicio = _ultima_linha_com_dados(aba) + 1
+                aba.append_rows(bloco, value_input_option="USER_ENTERED")
+                try:
+                    _aplicar_formatacao(spreadsheet, aba, linha_inicio, len(contagem), len(dias))
+                except Exception as e_fmt:
+                    return {"ok": True, "aba": nome_aba, "aviso_formatacao": str(e_fmt)}
+
+            return {"ok": True, "aba": nome_aba}
+
+        # --- Fluxo normal (restaurante de semana) ---
+        if bloco_existente and not forcar:
             return {"ok": False, "duplicado": True, "aba": nome_aba}
 
-        eh_nova = len(valores) < 3 or not any(
-            str(r[0]).strip() for r in valores[2:] if r
-        )
-        col_inicio = col_existente if col_existente is not None else _proxima_col_periodo(valores)
+        if bloco_existente:
+            inicio, fim = bloco_existente
+            total_linhas = len(aba.get_all_values())
+            if inicio == 1 and fim >= total_linhas:
+                aba.clear()
+            else:
+                aba.delete_rows(inicio, fim)
 
-        _escrever_periodo_horizontal(aba, valores, contagem, alunos, dias, periodo, col_inicio)
+        bloco = _construir_bloco(contagem, alunos, dias, periodo)
+        linha_inicio = _ultima_linha_com_dados(aba) + 1
+        aba.append_rows(bloco, value_input_option="USER_ENTERED")
 
         try:
-            # Congela colunas fixas ANTES de criar mesclagens (requisito da API)
-            if eh_nova:
-                _formatar_colunas_fixas(spreadsheet, aba, len(alunos))
-            _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, len(dias), len(contagem))
+            _aplicar_formatacao(spreadsheet, aba, linha_inicio, len(contagem), len(dias))
         except Exception as e_fmt:
             return {"ok": True, "aba": nome_aba, "aviso_formatacao": str(e_fmt)}
 

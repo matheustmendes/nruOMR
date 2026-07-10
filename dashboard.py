@@ -320,9 +320,9 @@ def _carregar_justificativas(forcar=False):
         E  Datas de ausência
         F  Comprovante de Ausência
         G  Parecer
-        H  Contabilizado
         I  Comentário (Se negado )
     """
+    
     def _load():
         cfg = _config()
         form_cfg = cfg.get("formulario_justificativas", {})
@@ -344,9 +344,16 @@ def _carregar_justificativas(forcar=False):
         c_datas = form_cfg.get("coluna_datas",        "Datas de ausência")
         c_comp  = form_cfg.get("coluna_comprovante",  "Comprovante de Ausência")
         c_par   = form_cfg.get("coluna_parecer",      "Parecer")
-        c_cont  = form_cfg.get("coluna_contabilizado","Contabilizado")
         c_comt  = form_cfg.get("coluna_comentario",   "Comentário (Se negado )")
-
+        
+        def _normalizar_links(valor: str) -> list[str]:
+            if not valor:
+                    return []
+                # Aceita separador por vírgula OU quebra de linha (cobre os dois formatos)
+            partes = re.split(r'[,\n\r]+', valor)
+            return [p.strip() for p in partes if p.strip()]
+    
+    
         def _get(row_norm, key):
             key_norm = key.strip().lower()
             for k, v in row_norm.items():
@@ -370,9 +377,8 @@ def _carregar_justificativas(forcar=False):
                     "matricula":     _limpar_matricula(_get(row, c_mat)),
                     "local":         _get(row, c_local),
                     "datas":         _get(row, c_datas),
-                    "comprovante":   _get(row, c_comp),
+                    "comprovante":   _normalizar_links(_get(row, c_comp)),
                     "parecer":       _get(row, c_par),
-                    "contabilizado": _get(row, c_cont),
                     "comentario":    _get(row, c_comt),
                 })
         return result
@@ -384,12 +390,11 @@ def _status_justificativa(j):
     """
     Determina o status com base nas colunas Contabilizado e Parecer.
     """
-    cont = j.get("contabilizado", "").strip().lower()
     par  = j.get("parecer", "").strip().lower()
 
-    if "sim" in cont or any(w in par for w in ("aprovad", "aceit", "deferido")):
+    if "sim" in par or any(w in par for w in ("aprovad", "aceit", "deferido")):
         return "justificado"
-    if "não" in cont or "nao" in cont or any(w in par for w in ("negad", "recusad", "indeferido")):
+    if "não" in par or "nao" in par or any(w in par for w in ("negad", "recusad", "indeferido")):
         return "negado"
     # Tem entrada mas nenhuma decisão ainda
     return "pendente"
@@ -417,9 +422,8 @@ def _cruzar(alunos, justificativas, mes):
         "status_just": "irregular",
         "justificado": False,
         "datas":        "",
-        "comprovante":  "",
+        "comprovante":  [],
         "parecer":      "",
-        "contabilizado": "",
         "comentario":   "",
     }
 
@@ -436,7 +440,7 @@ def _cruzar(alunos, justificativas, mes):
         # Mais recente primeiro; preferir os já com decisão
         candidatos_ord = sorted(
             candidatos,
-            key=lambda x: (x["contabilizado"] != "" or x["parecer"] != "", x["timestamp"]),
+            key=lambda x:  (x["parecer"] != "", x["timestamp"]),
             reverse=True,
         )
         melhor = candidatos_ord[0]
@@ -447,7 +451,6 @@ def _cruzar(alunos, justificativas, mes):
         aluno["datas"]          = melhor["datas"]
         aluno["comprovante"]    = melhor["comprovante"]
         aluno["parecer"]        = melhor["parecer"]
-        aluno["contabilizado"]  = melhor["contabilizado"]
         aluno["comentario"]     = melhor["comentario"]
 
     return alunos
@@ -504,7 +507,7 @@ def _exportar_xlsx(irregulares, mes):
     cabecalhos = [
         "Nr", "Matricula", "Nome", "Unidade",
         "Presencas no Mes", "Datas de Ausencia",
-        "Comprovante", "Parecer", "Contabilizado", "Status",
+        "Comprovante", "Parecer", "Status",
     ]
     for col, h in enumerate(cabecalhos, 1):
         c = ws.cell(row=3, column=col, value=h)
@@ -522,6 +525,9 @@ def _exportar_xlsx(irregulares, mes):
         row = 3 + i
         st  = aluno.get("status_just", "irregular")
         cor = _COR_STATUS.get(st, "FFE8E8")
+        comps = aluno.get("comprovante", [])
+        if isinstance(comps, list):
+            comps_str = ", ".join(comps)
 
         valores = [
             i,
@@ -530,9 +536,8 @@ def _exportar_xlsx(irregulares, mes):
             _UNIDADE_LEGIVEL.get(aluno.get("unidade", ""), aluno.get("unidade", "")),
             aluno.get("presencas_mes", 0),
             aluno.get("datas", ""),
-            aluno.get("comprovante", ""),
+            comps_str,
             aluno.get("parecer", ""),
-            aluno.get("contabilizado", ""),
             _LABEL_STATUS.get(st, st.capitalize()),
         ]
         colunas_esquerda = {3, 6, 7}

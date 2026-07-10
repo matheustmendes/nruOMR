@@ -49,5 +49,4 @@ formulario_justificativas:
   coluna_datas: "Datas de ausência"
   coluna_comprovante: "Comprovante de Ausência"
   coluna_parecer: "Parecer"
-  coluna_contabilizado: "Contabilizado"
   coluna_comentario: "Comentário (Se negado )"

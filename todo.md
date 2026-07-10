@@ -8,6 +8,8 @@
 
 - [x] Lógica de leitura de página incorreta: quando começa na página 2, lê os alunos da página 1 (xlsx) e interpreta como se fossem os da página 2. O certo é identificar a página e em qual aluno ela começa. (campo "Página inicial do scan" na UI + parâmetro `pagina_inicial` em `processar_pdf_completo`)
 - [ ] UI de casos ambíguos com contagem errada: aparece 252 casos em scan com 25 nomes. Problema na lógica do ambíguo.
+- [x] Documentos vindo das justificativa quebram quando há mais de um documento. 
+
 
 ## Melhorias
 

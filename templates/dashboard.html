@@ -372,6 +372,29 @@ function renderTabela() {
             <div class="${cls}">${val ? escHtml(val) : "—"}</div></div>`;
   }
 
+  function detalheCellComprovante(label, comprovante) {
+  const lista = Array.isArray(comprovante)
+    ? comprovante
+    : (comprovante ? [comprovante] : []);
+
+  if (lista.length === 0) {
+    return `<div><div class="detail-label">${label}</div>
+            <div class="detail-val vazio">—</div></div>`;
+  }
+
+  const links = lista
+    .map((link, i) => {
+      const texto = lista.length > 1 ? `Ver comprovante ${i + 1}` : "Ver comprovante";
+      return `<a href="${escHtml(link)}" target="_blank" class="text-primary d-block">
+                <i class="bi bi-file-earmark-text me-1"></i>${texto}
+              </a>`;
+    })
+    .join("");
+
+  return `<div><div class="detail-label">${label}</div>
+          <div class="detail-val">${links}</div></div>`;
+}
+
   const linhas = lista.map((a, i) => {
     const st         = STATUS_CFG[a.status_just] || STATUS_CFG.irregular;
     const presCorCls = a.status_just === "justificado" ? "text-success" : "text-danger";
@@ -398,14 +421,14 @@ function renderTabela() {
 
     // ── Justificativa (só se tiver) ───────────────────────────────────────
     const temJust    = a.status_just !== "irregular";
-    const compIsLink = a.comprovante && a.comprovante.startsWith("http");
+
     const justSection = temJust ? `
       <div class="row g-3 mb-2">
         <div class="col-12 col-md-4">
           ${detalheCell("Datas declaradas", a.datas)}
         </div>
         <div class="col-12 col-md-4">
-          ${detalheCell("Comprovante", a.comprovante, compIsLink)}
+          ${detalheCellComprovante("Comprovante", a.comprovante)}
         </div>
         <div class="col-12 col-md-4">
           ${detalheCell("Parecer", a.parecer + (a.contabilizado ? ` · Contabilizado: ${a.contabilizado}` : ""))}

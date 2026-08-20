@@ -189,17 +189,19 @@ def _aplicar_toda_formatacao(spreadsheet, aba, periodos_info, num_alunos):
     print("Removendo mesclagens antigas...")
     _unmerge_all(spreadsheet, aba)
 
+    linha_fim = num_alunos + 2  # 2 linhas de cabeçalho
+
     # Congela colunas/linhas fixas ANTES de criar mesclagens (requisito da API)
     print("Formatando colunas fixas (freeze)...")
     try:
-        _formatar_colunas_fixas(spreadsheet, aba, num_alunos)
+        _formatar_colunas_fixas(spreadsheet, aba, linha_fim)
     except Exception as e:
         print(f"  Aviso colunas fixas: {e}")
 
     print("Aplicando formatacao por periodo...")
     for periodo, col_inicio, dias in periodos_info:
         try:
-            _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, len(dias), num_alunos)
+            _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, len(dias), linha_fim)
             print(f"  {periodo}  OK")
         except Exception as e:
             print(f"  {periodo}  AVISO: {e}")
@@ -264,6 +266,7 @@ def migrar(restaurante_key, nome_aba):
 
     print("Limpando aba...")
     aba.clear()
+    _unmerge_all(spreadsheet, aba)  # mesclagens antigas bloqueiam a escrita
 
     print("Escrevendo dados...")
     aba.update(values=todas_linhas, range_name="A1", value_input_option="USER_ENTERED")

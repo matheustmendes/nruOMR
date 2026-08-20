@@ -97,6 +97,96 @@ def _blocos_de_aba(valores):
             yield i
 
 
+def _parsear_grupos_horizontais(valores):
+    """
+    Extrai [(periodo, dias, contagem, alunos)] do layout horizontal.
+
+        Linha 1:  (vazio A:C)       | Período: 05/05 a 09/05      | Período: ...
+        Linha 2:  Nº | Nome | Matr. | Presenças | Seg | ... | Sex | Presenças | ...
+        Linha 3+: uma linha por aluno
+    """
+    if len(valores) < 3:
+        return []
+
+    row1 = [str(c).strip() for c in valores[0]]
+    row2 = [str(c).strip() for c in valores[1]]
+
+    # A coluna A com "Período:" é do layout vertical antigo, não um grupo
+    inicios = [j for j, v in enumerate(row1) if j >= 3 and v.startswith("Período: ")]
+    if not inicios:
+        return []
+
+    alunos = []
+    linhas_alunos = []
+    for row in valores[2:]:
+        nome = str(row[1]).strip() if len(row) > 1 else ""
+        mat  = str(row[2]).strip() if len(row) > 2 else ""
+        if not nome and not mat:
+            break
+        alunos.append((nome, mat))
+        linhas_alunos.append(row)
+
+    if not alunos:
+        return []
+
+    grupos = []
+    for k, col in enumerate(inicios):
+        fim = inicios[k + 1] if k + 1 < len(inicios) else max(len(row1), len(row2))
+        periodo = row1[col][len("Período: "):].strip()
+        cols_dias = [
+            (row2[c], c) for c in range(col + 1, min(fim, len(row2))) if row2[c]
+        ]
+        dias = [d for d, _ in cols_dias]
+
+        contagem = []
+        for i, row in enumerate(linhas_alunos):
+            valor_pres = str(row[col]).strip() if col < len(row) else ""
+            marcas = {
+                dia: (str(row[c]).strip() if c < len(row) else "")
+                for dia, c in cols_dias
+            }
+            if not valor_pres and not any(marcas.values()):
+                continue  # aluno não lido nesse período
+
+            try:
+                presencas = int(valor_pres) if valor_pres else 0
+            except ValueError:
+                presencas = 0
+
+            contagem.append({
+                "numero":    i + 1,
+                "presencas": presencas,
+                "detalhes": {
+                    dia: {
+                        "presente": bool(val),
+                        "almoco":   "A" in val,
+                        "janta":    "J" in val,
+                    }
+                    for dia, val in marcas.items()
+                },
+            })
+
+        if contagem:
+            grupos.append((periodo, dias, contagem, alunos))
+
+    return grupos
+
+
+def _periodos_da_aba(valores):
+    """Extrai [(periodo, dias, contagem, alunos)] de qualquer um dos dois layouts."""
+    if valores and any(
+        str(c).strip().startswith("Período: ") for c in valores[0][3:]
+    ):
+        return _parsear_grupos_horizontais(valores)
+
+    periodos = []
+    for inicio_0idx in _blocos_de_aba(valores):
+        parsed = _parsear_bloco(valores, inicio_0idx)
+        if parsed is not None:
+            periodos.append(parsed)
+    return periodos
+
+
 def popular_restaurante(restaurante_key, filtro_periodo=None, dry_run=False):
     from google_sheets import _carregar_config, _obter_cliente, exportar_para_dashboard
 
@@ -116,13 +206,7 @@ def popular_restaurante(restaurante_key, filtro_periodo=None, dry_run=False):
     for aba in spreadsheet.worksheets():
         valores = aba.get_all_values()
 
-        for inicio_0idx in _blocos_de_aba(valores):
-            parsed = _parsear_bloco(valores, inicio_0idx)
-            if parsed is None:
-                continue
-
-            periodo, dias, contagem, alunos = parsed
-
+        for periodo, dias, contagem, alunos in _periodos_da_aba(valores):
             if filtro_periodo and periodo != filtro_periodo:
                 continue
 

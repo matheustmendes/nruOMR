@@ -161,17 +161,123 @@ def _limpar_matricula(v):
     return s
 
 
+_PREFIXO_PERIODO = "Período:"
+_COL_FIXAS = 3  # Nº, Nome, Matrícula
+
+
 def _parse_aba(rows):
     """
     Parseia as linhas de uma aba mensal (ex: 'Maio 2026') de um restaurante.
 
-    Estrutura esperada:
+    Aceita os dois layouts:
+      - horizontal (atual): períodos lado a lado, um grupo de colunas cada
+      - vertical (legado):  períodos empilhados em blocos
+
+    Retorna lista de {nome, matricula, presencas_semana, periodo, dias}.
+    """
+    if _eh_horizontal(rows):
+        return _parse_aba_horizontal(rows)
+    return _parse_aba_vertical(rows)
+
+
+def _eh_horizontal(rows):
+    """Layout horizontal: marcador de período na linha 1, à direita das colunas fixas."""
+    if not rows:
+        return False
+    primeira = [str(c).strip() for c in rows[0]]
+    return any(c.startswith(_PREFIXO_PERIODO) for c in primeira[_COL_FIXAS:])
+
+
+def _parse_aba_horizontal(rows):
+    """
+    Layout horizontal:
+        Linha 1:  (vazio A:C)       | Período: 05/05 a 09/05      | Período: 12/05 ...
+        Linha 2:  Nº | Nome | Matr. | Presenças | Seg | ... | Sex | Presenças | ...
+        Linha 3+: uma linha por aluno, permanente no mês
+
+    Gera um registro por (aluno, período) — mesma forma do parser vertical.
+    """
+    if len(rows) < 3:
+        return []
+
+    row1 = [str(c).strip() for c in rows[0]]
+    row2 = [str(c).strip() for c in rows[1]]
+
+    inicios = [
+        j for j, v in enumerate(row1)
+        if j >= _COL_FIXAS and v.startswith(_PREFIXO_PERIODO)
+    ]
+
+    grupos = []  # (periodo, col_presencas, [(dia, col)])
+    for k, col in enumerate(inicios):
+        fim = inicios[k + 1] if k + 1 < len(inicios) else max(len(row1), len(row2))
+        periodo = row1[col].replace(_PREFIXO_PERIODO, "").strip()
+        col_dias = [
+            (row2[c], c)
+            for c in range(col + 1, min(fim, len(row2)))
+            if row2[c] in _NOMES_DIAS
+        ]
+        grupos.append((periodo, col, col_dias))
+
+    resultado = []
+    for row in rows[2:]:
+        cells = [str(c).strip() for c in row]
+        if not any(cells):
+            continue
+
+        nome      = cells[1] if len(cells) > 1 else ""
+        matricula = _limpar_matricula(cells[2]) if len(cells) > 2 else ""
+        if not nome and not matricula:
+            continue
+
+        semanas_do_aluno = 0
+        for periodo, col_pres, col_dias in grupos:
+            try:
+                presencas = (
+                    int(cells[col_pres])
+                    if col_pres < len(cells) and cells[col_pres] else 0
+                )
+            except ValueError:
+                presencas = 0
+
+            dias = {
+                _DIA_ABREV.get(dia, dia): (cells[idx] if idx < len(cells) else "")
+                for dia, idx in col_dias
+            }
+
+            # Semana sem célula preenchida: o aluno não foi lido nesse período
+            if (col_pres >= len(cells) or not cells[col_pres]) and not any(dias.values()):
+                continue
+
+            semanas_do_aluno += 1
+            resultado.append({
+                "nome":             nome,
+                "matricula":        matricula,
+                "presencas_semana": presencas,
+                "periodo":          periodo,
+                "dias":             dias,
+            })
+
+        # Aluno sem nenhuma semana lida ainda assim conta no mês (0 presenças)
+        if not semanas_do_aluno:
+            resultado.append({
+                "nome":             nome,
+                "matricula":        matricula,
+                "presencas_semana": 0,
+                "periodo":          "",
+                "dias":             {},
+            })
+
+    return resultado
+
+
+def _parse_aba_vertical(rows):
+    """
+    Layout legado (blocos empilhados):
         Período: 05/05 a 09/05        ← cabeçalho de semana (merged)
         Nº | Nome | Matrícula | Presenças | Seg | ...
         1  | João  | 123456   | 3         | AJ  | ...
         (linha vazia)
-
-    Retorna lista de {nome, matricula, presencas_semana, periodo}.
     """
     resultado = []
     periodo = ""

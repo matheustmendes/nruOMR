@@ -238,6 +238,9 @@ def rota_processar():
 
         if resultado_sheets.get("ok"):
             sheets_resp = {"sheets_status": "ok", "sheets_aba": resultado_sheets.get("aba", "")}
+            aviso = resultado_sheets.get("aviso_ordem") or resultado_sheets.get("aviso_formatacao")
+            if aviso:
+                sheets_resp["sheets_aviso"] = aviso
         elif resultado_sheets.get("duplicado"):
             sheets_resp = {"sheets_status": "duplicado", "sheets_aba": resultado_sheets.get("aba", "")}
         else:
@@ -1552,6 +1555,18 @@ if __name__ == "__main__":
     print("=" * 50)
     print("  Sistema de presença — Interface web")
     print("=" * 50)
+
+    # O servidor carrega os módulos uma única vez, na inicialização. Mostrar a
+    # data do arquivo deixa claro se esta janela está com o código atualizado
+    # ou se precisa ser fechada e reaberta depois de uma alteração.
+    try:
+        from datetime import datetime as _dt
+        import google_sheets as _gs
+        _quando = _dt.fromtimestamp(os.path.getmtime(_gs.__file__))
+        print(f"\n  Código de planilhas carregado: {_quando:%d/%m/%Y %H:%M}")
+    except Exception:
+        pass
+
     print(f"\n  Acesse: http://localhost:{port}\n")
 
     # Abre o navegador automaticamente

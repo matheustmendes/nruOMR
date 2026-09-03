@@ -33,7 +33,7 @@ from urllib.parse import parse_qs
 from localizar_marcadores import carregar_imagem, processar
 from ler_bolhas import (
     ler_pagina, carregar_posicoes,
-    _get_offset_y, _get_threshold,
+    _get_offset_y, _get_threshold, get_zona_ambigua,
     mm_para_px
 )
 from exportar import (
@@ -54,13 +54,7 @@ def extrair_recortes(paginas_alinhadas, binarios, config, resultados_por_pagina,
     dias = config["layout"]["dias"]
     offset_y = _get_offset_y(config)
     threshold = _get_threshold(config)
-    scan = config.get("scan", {})
-    # Margem assimétrica: abaixo do threshold é pequena pra não capturar bolhas
-    # vazias (que leem ~33%); acima é maior pra pegar marcações leves.
-    margem_abaixo = scan.get("ambiguo_margem_abaixo", 0.04)
-    margem_acima = scan.get("ambiguo_margem_acima", 0.10)
-    ambiguo_min = threshold - margem_abaixo
-    ambiguo_max = threshold + margem_acima
+    ambiguo_min, ambiguo_max = get_zona_ambigua(config)
     ambiguos = []
 
     for pag_idx, (alinhada, binary, resultados) in enumerate(
@@ -101,13 +95,19 @@ def extrair_recortes(paginas_alinhadas, binarios, config, resultados_por_pagina,
                     _, buffer = cv2.imencode(".png", recorte)
                     b64 = base64.b64encode(buffer).decode("utf-8")
 
-                    # Nome do aluno
-                    nome = alunos[num_global - 1][0] if num_global - 1 < len(alunos) else f"Aluno {num_global}"
+                    # Identidade da linha, vinda do roster do lote impresso.
+                    # A matrícula aparece na tela para o conferente poder bater
+                    # o caso com a folha física em vez de confiar na ordem.
+                    if num_global - 1 < len(alunos):
+                        nome, matricula = alunos[num_global - 1]
+                    else:
+                        nome, matricula = f"Aluno {num_global}", ""
 
                     ambiguos.append({
                         "id": f"{num_global}_{dia}_{tipo}",
                         "numero": int(num_global),
                         "nome": nome,
+                        "matricula": matricula,
                         "dia": dia,
                         "tipo": tipo,
                         "pct": float(pct),
@@ -133,11 +133,27 @@ def _exportar_js(submit_url):
         .then(data => {{
             btn.disabled = false;
             btn.textContent = 'Salvar correções';
-            if (data.sucesso) {{
-                document.getElementById('export-msg').style.display = 'block';
-            }} else {{
+            if (!data.sucesso) {{
                 alert('Erro ao salvar: ' + (data.erro || 'desconhecido'));
+                return;
             }}
+            // A correção só está de fato valendo quando chegou ao Sheets.
+            // Antes, uma falha ali passava em silêncio e a planilha
+            // compartilhada continuava com a leitura automática.
+            var caixa = document.getElementById('export-msg');
+            if (data.sheets_ok) {{
+                caixa.textContent = 'Correções salvas e enviadas ao Google Sheets'
+                    + (data.sheets_aba ? ' (' + data.sheets_aba + ').' : '.');
+                caixa.style.background = '#eef7ee';
+                caixa.style.color = '#2a6b2a';
+            }} else {{
+                caixa.textContent = 'Correções salvas na planilha local, mas NÃO foram '
+                    + 'para o Google Sheets: ' + (data.sheets_erro || 'falha desconhecida')
+                    + '. Reenvie pela tela principal.';
+                caixa.style.background = '#fff8e6';
+                caixa.style.color = '#7a5a10';
+            }}
+            caixa.style.display = 'block';
         }})
         .catch(() => {{
             btn.disabled = false;
@@ -199,7 +215,7 @@ def gerar_html_revisao(ambiguos, contagem, alunos, dias, arquivo_json, submit_ur
             </div>
             <div class="card-info">
                 <div class="card-aluno">#{a['numero']} {a['nome']}</div>
-                <div class="card-detalhe">{a['dia']} — {tipo_label} — {a['pct']:.0%}</div>
+                <div class="card-detalhe">{('mat. ' + a['matricula'] + ' — ') if a.get('matricula') else ''}{a['dia']} — {tipo_label} — {a['pct']:.0%}</div>
                 <div class="card-acoes">
                     <button class="btn btn-marcado {'btn-ativo' if a['marcado_auto'] else ''}"
                             onclick="setMarcado('{a['id']}', true)">● Marcado</button>

@@ -13,5 +13,10 @@ credentials_sheets.json
 .claude/
 .vscode/
 .ipynb_checkpoints/
-poppler/
 Untitled.ipynb
+
+# Lotes: contem nomes e matriculas dos beneficiarios (dado pessoal)
+lotes/
+auditoria_*.csv
+plano_correcao.csv
+reconciliacao_*.csv

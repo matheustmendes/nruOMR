@@ -17,13 +17,88 @@ import yaml
 OFFSET_Y = -3
 THRESHOLD = 0.40
 
+# Fração do raio usada para medir o interior do círculo. O valor tem que ser
+# pequeno o bastante para não encostar na borda impressa (1.5pt ≈ 4px a 200dpi)
+# nem sofrer com o desalinhamento residual do scanner.
+MEDICAO_FRACAO = 0.65
+
+# "interior" mede só o miolo do círculo; "quadrado" reproduz o comportamento
+# antigo (ROI quadrada de lado 2r), mantido apenas para reprocessar leituras
+# calibradas com o método anterior.
+MEDICAO = "interior"
+
+# Calibração padrão por modo de medição. Os dois conjuntos NÃO são
+# intercambiáveis: no modo "quadrado" a borda impressa já responde por ~29% da
+# área medida, então o ponto de corte precisa ficar alto; no modo "interior" a
+# borda sai da conta e um círculo vazio lê perto de zero.
+#
+# Valores do modo "interior" calibrados sobre scan real (500 bolhas):
+#   vazios      → 0,00–0,09  (384 de 500 abaixo de 0,05)
+#   preenchidos → 0,27–0,93  (mediana ~0,68; ninguém preenche o círculo inteiro)
+# O corte em 0,20 fica no meio do vão, e a zona ambígua 0,10–0,45 cobre a cauda
+# baixa das marcações reais, que é onde mora a dúvida de verdade.
+CALIBRACAO = {
+    "interior": {"threshold": 0.20, "margem_abaixo": 0.10, "margem_acima": 0.25},
+    "quadrado": {"threshold": 0.40, "margem_abaixo": 0.04, "margem_acima": 0.10},
+}
+
+# Cache dos discos de medição por raio — a máscara é a mesma para todos os
+# círculos de uma página e recalculá-la milhares de vezes é desperdício.
+_MASCARAS = {}
+
 
 def _get_offset_y(config: dict) -> float:
     return config.get("scan", {}).get("offset_y", OFFSET_Y)
 
 
+def _get_medicao(config: dict) -> str:
+    return config.get("scan", {}).get("medicao", MEDICAO)
+
+
+def _get_medicao_fracao(config: dict) -> float:
+    return config.get("scan", {}).get("medicao_fracao", MEDICAO_FRACAO)
+
+
+def _calibracao(config: dict) -> dict:
+    return CALIBRACAO.get(_get_medicao(config), CALIBRACAO["quadrado"])
+
+
 def _get_threshold(config: dict) -> float:
-    return config.get("scan", {}).get("threshold", THRESHOLD)
+    """
+    Ponto de corte marcado/vazio.
+
+    Um `scan.threshold` explícito no config sempre vence; sem ele, o padrão
+    acompanha o modo de medição, porque o mesmo número significa coisas
+    diferentes nos dois modos.
+    """
+    return config.get("scan", {}).get("threshold", _calibracao(config)["threshold"])
+
+
+def get_zona_ambigua(config: dict):
+    """
+    Faixa de percentuais que vai para conferência humana: (mínimo, máximo).
+
+    Centralizada aqui porque antes cada chamador remontava a faixa com os
+    mesmos dois `.get()` — e bastava um deles divergir para a contagem exibida
+    não bater com a lista de casos apresentada na revisão.
+    """
+    scan = config.get("scan", {})
+    cal = _calibracao(config)
+    threshold = _get_threshold(config)
+    abaixo = scan.get("ambiguo_margem_abaixo", cal["margem_abaixo"])
+    acima = scan.get("ambiguo_margem_acima", cal["margem_acima"])
+    return threshold - abaixo, threshold + acima
+
+
+def _mascara_disco(raio_px: float):
+    """Máscara booleana circular de raio `raio_px`, centrada na ROI."""
+    chave = round(raio_px, 2)
+    if chave not in _MASCARAS:
+        lado = max(1, int(round(raio_px * 2)))
+        yy, xx = np.ogrid[:lado, :lado]
+        centro = (lado - 1) / 2.0
+        _MASCARAS[chave] = (yy - centro) ** 2 + (xx - centro) ** 2 <= raio_px ** 2
+    return _MASCARAS[chave]
 
 
 def mm_para_px(valor_mm: float, dpi: int = 200) -> float:
@@ -67,7 +142,8 @@ def carregar_posicoes(config: dict) -> dict:
     }
 
 
-def ler_circulo(binary: np.ndarray, cx: float, cy: float, raio_px: float) -> float:
+def ler_circulo(binary: np.ndarray, cx: float, cy: float, raio_px: float,
+                medicao: str = MEDICAO, fracao: float = MEDICAO_FRACAO) -> float:
     """
     Analisa um único círculo e retorna a proporção de marcação.
 
@@ -75,30 +151,58 @@ def ler_circulo(binary: np.ndarray, cx: float, cy: float, raio_px: float) -> flo
       - pixels 255 (branco) = tinta/marcação
       - pixels 0 (preto) = fundo
 
+    Por que medir só o interior
+    ---------------------------
+    A versão original media uma ROI quadrada de lado 2r, que inclui a borda
+    impressa do círculo inteira. Essa borda sozinha ocupa cerca de 29% da área
+    medida (verificado em scan real: círculos vazios liam 0,26–0,30 contra um
+    threshold de 0,40). A folga até a zona ambígua era de apenas ~0,07 — e
+    qualquer scan um pouco mais escuro, ou uma impressão com traço mais grosso,
+    empurrava *todos* os círculos vazios para dentro dela de uma vez. É essa a
+    origem dos "252 casos ambíguos num scan de 25 nomes": não é contagem
+    errada, é a medição encostando na borda.
+
+    Medindo um disco de 0,65·r, a borda fica de fora: no mesmo scan os vazios
+    passam a ler ~0,02 e os preenchidos ~0,90. O threshold de 0,40 continua
+    válido, agora com folga dos dois lados.
+
     Args:
         binary: imagem binarizada (BINARY_INV)
         cx, cy: centro do círculo em pixels
-        raio_px: raio do círculo em pixels
+        raio_px: raio do círculo impresso em pixels
+        medicao: "interior" (padrão) ou "quadrado" (comportamento antigo)
+        fracao: fração do raio medida no modo "interior"
 
     Returns:
         float entre 0 e 1 — proporção de pixels marcados
     """
     h, w = binary.shape[:2]
 
-    # Recorta ROI quadrada ao redor do centro
-    x1 = max(0, int(cx - raio_px))
-    y1 = max(0, int(cy - raio_px))
-    x2 = min(w, int(cx + raio_px))
-    y2 = min(h, int(cy + raio_px))
+    if medicao == "quadrado":
+        x1 = max(0, int(cx - raio_px))
+        y1 = max(0, int(cy - raio_px))
+        x2 = min(w, int(cx + raio_px))
+        y2 = min(h, int(cy + raio_px))
+        roi = binary[y1:y2, x1:x2]
+        return (np.count_nonzero(roi) / roi.size) if roi.size else 0.0
 
-    roi = binary[y1:y2, x1:x2]
+    raio_int = raio_px * fracao
+    lado = max(1, int(round(raio_int * 2)))
 
-    total = roi.size
+    x1 = int(round(cx - raio_int))
+    y1 = int(round(cy - raio_int))
+
+    # Fora da página: sem pixel para medir.
+    if x1 < 0 or y1 < 0 or x1 + lado > w or y1 + lado > h:
+        return 0.0
+
+    roi = binary[y1:y1 + lado, x1:x1 + lado]
+    mascara = _mascara_disco(raio_int)
+    total = np.count_nonzero(mascara)
     if total == 0:
         return 0.0
 
-    marcados = np.count_nonzero(roi)  # pixels == 255
-    return marcados / total
+    return np.count_nonzero(roi[mascara]) / total
 
 
 def ler_pagina(binary: np.ndarray, config: dict, num_alunos: int,
@@ -126,6 +230,8 @@ def ler_pagina(binary: np.ndarray, config: dict, num_alunos: int,
     if threshold is None:
         threshold = _get_threshold(config)
     offset_y = _get_offset_y(config)
+    medicao = _get_medicao(config)
+    fracao = _get_medicao_fracao(config)
     resultados = []
 
     for i in range(num_alunos):
@@ -139,8 +245,8 @@ def ler_pagina(binary: np.ndarray, config: dict, num_alunos: int,
         for dia in pos["dias"]:
             ax, jx = pos["circulos_x"][dia]
 
-            almoco_pct = ler_circulo(binary, ax, cy, pos["raio_px"])
-            janta_pct = ler_circulo(binary, jx, cy, pos["raio_px"])
+            almoco_pct = ler_circulo(binary, ax, cy, pos["raio_px"], medicao, fracao)
+            janta_pct = ler_circulo(binary, jx, cy, pos["raio_px"], medicao, fracao)
 
             aluno["dias"][dia] = {
                 "almoco": almoco_pct >= threshold,

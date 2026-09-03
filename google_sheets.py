@@ -456,13 +456,23 @@ def _sincronizar_roster(valores, alunos):
 
 # --- Montagem e escrita do grupo de colunas --------------------------------
 
-def _montar_matriz_grupo(valores, grupo, dias_novos, dados_por_linha, linha_fim):
+def _montar_matriz_grupo(valores, grupo, dias_novos, dados_por_linha, linha_fim,
+                         limpar_ausentes=False):
     """
     Monta a matriz [Presenças, dia1, dia2, ...] de todas as linhas de aluno.
 
     Marcas já gravadas em dias que não estão em `dias_novos` são preservadas
     (é o que mantém os dias úteis intactos quando o FDS entra no mesmo grupo,
     e vice-versa). "Presenças" é recalculado como o número de dias marcados.
+
+    Args:
+        limpar_ausentes: apaga as marcas dos `dias_novos` nas linhas que a fonte
+            NÃO cobre. Fora da reconciliação isso seria perigoso — num scan
+            parcial as linhas não lidas apagariam presença legítima —, então o
+            padrão é preservar. Na reconciliação é o contrário: sem limpar, as
+            marcas que o lançamento errado deixou em linhas fantasma ("Aluno N")
+            ou em pessoas que saíram da lista ficariam lá para sempre, já que
+            essas linhas não aparecem no roster correto.
 
     Returns: (ordem_dias, matriz)
     """
@@ -488,8 +498,15 @@ def _montar_matriz_grupo(valores, grupo, dias_novos, dados_por_linha, linha_fim)
         if dados is not None:
             for dia in dias_novos:
                 marcas[dia] = dados["marcas"].get(dia, "")
+        elif limpar_ausentes:
+            for dia in dias_novos:
+                marcas[dia] = ""
 
-        if ordem and (dados is not None or any(marcas.values())):
+        # Com `limpar_ausentes`, a linha zerada também precisa recalcular o
+        # total: sem isso as células ficam vazias mas "Presenças" mantém o
+        # número do lançamento errado — o pior dos dois mundos, porque some a
+        # evidência e fica o resultado.
+        if ordem and (dados is not None or limpar_ausentes or any(marcas.values())):
             presencas = sum(1 for dia in ordem if marcas.get(dia))
         elif not ordem and dados is not None:
             # Importação legada: só o total, sem detalhamento por dia
@@ -781,7 +798,8 @@ _HEADERS_RESUMO = [
 ]
 
 
-def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forcar=False):
+def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo,
+                         forcar=False, limpar_ausentes=False):
     """
     Exporta dados de presença para Google Sheets (layout horizontal).
 
@@ -799,6 +817,10 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
         restaurante_key: "canela", "ondina", "sao_lazaro" ou variantes _fds
         periodo: string do período, ex: "05/05 a 09/05"
         forcar: se True, sobrescreve o período existente sem perguntar
+        limpar_ausentes: se True, apaga as marcas dos `dias` nas linhas que não
+            estão em `contagem`. Use apenas quando a fonte cobre o período
+            inteiro (reconciliação); num scan parcial isso apagaria presença
+            legítima das linhas que não foram lidas.
 
     Returns:
         dict:
@@ -896,7 +918,7 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
             dados_por_linha[linha] = {"marcas": marcas, "presencas": c["presencas"]}
 
         ordem_dias, matriz = _montar_matriz_grupo(
-            valores, grupo, dias, dados_por_linha, linha_fim
+            valores, grupo, dias, dados_por_linha, linha_fim, limpar_ausentes
         )
 
         _garantir_grade(aba, linha_fim, col_inicio + 1 + len(ordem_dias))
@@ -941,6 +963,194 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo, forca
 
     except Exception as e:
         return {"ok": False, "erro": str(e)}
+
+
+# --- LEITURA (auditoria do que já foi lançado) ------------------------------
+#
+# Até aqui este módulo só escrevia. Para conferir lançamentos antigos é preciso
+# ler de volta o que está na planilha compartilhada e comparar com a releitura
+# do scan — sem isso não há como saber quais semanas saíram trocadas.
+
+def _com_retry(operacao, tentativas=5, espera_inicial=8.0):
+    """
+    Repete a chamada quando a API responde 429 (cota por minuto estourada).
+
+    Varrer todas as abas de todos os restaurantes faz dezenas de leituras em
+    poucos segundos e bate no limite de 60 leituras/minuto por usuário. Sem
+    isso a varredura falha na metade e o diagnóstico sai incompleto — pior do
+    que demorar, porque parece que não havia nada a achar.
+    """
+    import time
+
+    espera = espera_inicial
+    for tentativa in range(tentativas):
+        try:
+            return operacao()
+        except Exception as e:
+            if "429" not in str(e) or tentativa == tentativas - 1:
+                raise
+            print(f"    (cota da API atingida — aguardando {espera:.0f}s)")
+            time.sleep(espera)
+            espera *= 1.6
+
+
+def _abrir_aba(restaurante_key, nome_aba):
+    """Abre uma aba existente. Devolve (aba, valores) ou (None, erro)."""
+    config = _carregar_config()
+    restaurante_efetivo = _RESTAURANTE_PAI.get(restaurante_key, restaurante_key)
+
+    rest = config.get("restaurantes", {}).get(restaurante_efetivo, {})
+    spreadsheet_id = rest.get("spreadsheet_id", "").strip()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            f"spreadsheet_id não configurado para '{restaurante_efetivo}' "
+            "em config_sheets.yaml"
+        )
+
+    spreadsheet = _com_retry(lambda: _obter_cliente(config).open_by_key(spreadsheet_id))
+    try:
+        aba = spreadsheet.worksheet(nome_aba)
+    except gspread.WorksheetNotFound:
+        return None, f"Aba '{nome_aba}' não existe nesta planilha."
+    return aba, _com_retry(aba.get_all_values)
+
+
+def listar_abas_mes(restaurante_key):
+    """Nomes das abas mensais existentes na planilha do restaurante."""
+    config = _carregar_config()
+    restaurante_efetivo = _RESTAURANTE_PAI.get(restaurante_key, restaurante_key)
+    rest = config.get("restaurantes", {}).get(restaurante_efetivo, {})
+    spreadsheet_id = rest.get("spreadsheet_id", "").strip()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            f"spreadsheet_id não configurado para '{restaurante_efetivo}'."
+        )
+    spreadsheet = _com_retry(lambda: _obter_cliente(config).open_by_key(spreadsheet_id))
+    return [ws.title for ws in _com_retry(spreadsheet.worksheets)]
+
+
+def ler_periodo(restaurante_key, periodo, nome_aba=None):
+    """
+    Lê o que está gravado na planilha para um período.
+
+    Returns:
+        {"ok": True, "aba": str, "periodo": str, "dias": [...],
+         "linhas": [{"linha", "nome", "matricula", "presencas", "marcas"}]}
+        ou {"ok": False, "erro": "..."}
+    """
+    nome_aba = nome_aba or _nome_aba_mes(periodo)
+    aba, valores = _abrir_aba(restaurante_key, nome_aba)
+    if aba is None:
+        return {"ok": False, "erro": valores}
+
+    grupo = next((g for g in _ler_grupos(valores) if g["periodo"] == periodo), None)
+    if grupo is None:
+        return {
+            "ok": False,
+            "erro": f"Período '{periodo}' não encontrado na aba '{nome_aba}'.",
+            "aba": nome_aba,
+        }
+
+    def celula(row, col):
+        return str(row[col]).strip() if col < len(row) else ""
+
+    linhas = []
+    for i in range(_LINHA_DADOS - 1, len(valores)):
+        row = valores[i]
+        nome = celula(row, 1)
+        mat = celula(row, 2)
+        if not nome and not mat:
+            break
+        linhas.append({
+            "linha": i + 1,
+            "nome": nome,
+            "matricula": _norm_mat(mat),
+            "presencas": celula(row, grupo["col"]),
+            "marcas": {d: celula(row, c) for d, c in grupo["cols_dias"].items()},
+        })
+
+    return {
+        "ok": True,
+        "aba": nome_aba,
+        "periodo": periodo,
+        "dias": grupo["dias"],
+        "linhas": linhas,
+    }
+
+
+def diagnosticar_aba(restaurante_key, nome_aba):
+    """
+    Procura, sem precisar de nenhum scan, os rastros que uma lista de
+    referência trocada deixa na planilha.
+
+    O mais decisivo são as linhas "Aluno N": `exportar_para_sheets` só as cria
+    quando o scan leu MAIS linhas do que a planilha de referência tinha — ou
+    seja, prova de que as duas não batiam. As demais checagens são indícios,
+    e estão marcadas como tal.
+
+    Returns:
+        {"ok": True, "aba", "total_linhas", "fantasmas", "duplicadas",
+         "periodos": [{"periodo", "dias", "com_marcacao", "ultima_linha",
+                       "fantasmas_marcados"}]}
+    """
+    aba, valores = _abrir_aba(restaurante_key, nome_aba)
+    if aba is None:
+        return {"ok": False, "erro": valores}
+
+    roster = _ler_roster(valores)
+    grupos = _ler_grupos(valores)
+
+    fantasmas = [
+        r for r in roster
+        if re.fullmatch(r"Aluno\s+\d+", r["nome"].strip()) and not r["mat"]
+    ]
+
+    vistas, duplicadas = {}, []
+    for r in roster:
+        chave = _norm_mat(r["mat"])
+        if not chave:
+            continue
+        if chave in vistas:
+            duplicadas.append({
+                "matricula": chave,
+                "linhas": [vistas[chave]["linha"], r["linha"]],
+                "nomes": [vistas[chave]["nome"], r["nome"]],
+            })
+        else:
+            vistas[chave] = r
+
+    linhas_fantasma = {r["linha"] for r in fantasmas}
+
+    periodos = []
+    for g in grupos:
+        cols = list(g["cols_dias"].values())
+        com_marcacao, ultima, fantasmas_marcados = 0, 0, 0
+        for i in range(_LINHA_DADOS - 1, len(valores)):
+            row = valores[i]
+            marcou = any(
+                c < len(row) and str(row[c]).strip() for c in cols
+            )
+            if marcou:
+                com_marcacao += 1
+                ultima = i + 1
+                if (i + 1) in linhas_fantasma:
+                    fantasmas_marcados += 1
+        periodos.append({
+            "periodo": g["periodo"],
+            "dias": g["dias"],
+            "com_marcacao": com_marcacao,
+            "ultima_linha": ultima,
+            "fantasmas_marcados": fantasmas_marcados,
+        })
+
+    return {
+        "ok": True,
+        "aba": nome_aba,
+        "total_linhas": len(roster),
+        "fantasmas": fantasmas,
+        "duplicadas": duplicadas,
+        "periodos": periodos,
+    }
 
 
 # --- DASHBOARD ANALÍTICO (Looker Studio) ---

@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import yaml
@@ -96,14 +97,27 @@ def ler_planilha(caminho_xlsx: str, nome_aba: str) -> dict:
             mes_ano = val
 
     alunos = []
-    for row in ws.iter_rows(min_row=8, values_only=True):
+    ignoradas = []
+    for idx_linha, row in enumerate(ws.iter_rows(min_row=8, values_only=True), start=8):
         if len(row) < 3:
             continue
 
         nome = row[1]
         matricula = row[2]
 
-        if not nome or not str(nome).strip():
+        tem_nome = bool(nome and str(nome).strip())
+        tem_matricula = bool(matricula is not None and str(matricula).strip())
+
+        if not tem_nome:
+            # Linha sem nome é pulada — e isso desloca todo mundo abaixo dela.
+            # Registrar é o que permite o operador perceber que a planilha tem
+            # um buraco, em vez de descobrir depois pela presença errada.
+            if tem_matricula:
+                ignoradas.append({
+                    "linha_planilha": idx_linha,
+                    "motivo": "sem nome, mas com matrícula preenchida",
+                    "matricula": str(matricula).strip(),
+                })
             continue
 
         nome = str(nome).strip()
@@ -124,6 +138,7 @@ def ler_planilha(caminho_xlsx: str, nome_aba: str) -> dict:
         "mes_ano": mes_ano,
         "datas": datas,
         "alunos": alunos,
+        "linhas_ignoradas": ignoradas,
     }
 
 
@@ -324,9 +339,16 @@ def desenhar_linha_aluno(c, y, numero, nome, matricula, posicoes_circulos, layou
         c.circle(x_a, y_circulo, CIRCULO_RAIO, fill=1)
         c.circle(x_j, y_circulo, CIRCULO_RAIO, fill=1)
 
+    return nome_renderizado
 
-def desenhar_rodape(c, largura):
-    """Desenha instrução no rodapé."""
+
+def desenhar_rodape(c, largura, lote_id=None):
+    """
+    Desenha instrução no rodapé — e, quando houver, o identificador do lote.
+
+    O lote_id impresso é o que permite reencontrar o snapshot certo a partir de
+    uma folha física solta, meses depois, sem depender da memória de ninguém.
+    """
     c.setFont(*FONTE_CORPO)
     c.setFillColor("black")
     y = MARCADOR_MARGEM + MARCADOR_TAM + 4 * mm
@@ -335,9 +357,23 @@ def desenhar_rodape(c, largura):
         "INSTRUÇÃO: Preencha completamente o círculo ( ● ) para registrar presença."
     )
 
+    if lote_id:
+        c.setFont("Helvetica", 7)
+        c.setFillColor("#555555")
+        c.drawString(MARGEM_ESQUERDA, y - 4 * mm, f"lote {lote_id}")
+        c.setFillColor("black")
 
-def gerar_template(info: dict, dias: list, arquivo_saida: str):
-    """Gera o PDF completo do template."""
+
+def gerar_template(info: dict, dias: list, arquivo_saida: str, lote_id: str = None):
+    """
+    Gera o PDF completo do template.
+
+    Returns:
+        dict com a geometria usada e `paginacao`: a lista, na ordem impressa,
+        de {numero, pagina, linha_pagina, nome, nome_impresso, matricula}.
+        É essa lista que vira o snapshot do lote — a única fonte de verdade
+        sobre quem ocupa cada linha desta impressão.
+    """
     alunos = info["alunos"]
 
     c = canvas.Canvas(arquivo_saida, pagesize=A4)
@@ -353,6 +389,7 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
 
     total_paginas = (len(alunos) + alunos_por_pagina - 1) // alunos_por_pagina
     pagina_atual = 1
+    paginacao = []
 
     for idx_inicio in range(0, len(alunos), alunos_por_pagina):
         alunos_pagina = alunos[idx_inicio:idx_inicio + alunos_por_pagina]
@@ -371,7 +408,17 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
 
         for i, (nome, matricula) in enumerate(alunos_pagina):
             numero = idx_inicio + i + 1
-            desenhar_linha_aluno(c, y, numero, nome, matricula, posicoes_circulos, layout)
+            nome_impresso = desenhar_linha_aluno(
+                c, y, numero, nome, matricula, posicoes_circulos, layout
+            )
+            paginacao.append({
+                "numero": numero,
+                "pagina": pagina_atual,
+                "linha_pagina": i + 1,
+                "nome": nome,
+                "nome_impresso": nome_impresso,
+                "matricula": matricula,
+            })
             y -= LINHA_ALTURA
         y_base_tabela = y + LINHA_ALTURA - 4 * mm
 
@@ -383,7 +430,7 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
             x_linha = (x_j_anterior + x_a_atual) / 2
             c.line(x_linha, y_topo_tabela, x_linha, y_base_tabela)
 
-        desenhar_rodape(c, largura)
+        desenhar_rodape(c, largura, lote_id)
 
         if idx_inicio + alunos_por_pagina < len(alunos):
             c.showPage()
@@ -403,10 +450,19 @@ def gerar_template(info: dict, dias: list, arquivo_saida: str):
         "alunos_por_pagina": alunos_por_pagina,
         "total_paginas": total_paginas,
         "primeiro_circulo_y_reportlab": primeiro_circulo_y,
+        "paginacao": paginacao,
+        "lote_id": lote_id,
     }
 
 
-def gerar_config(info: dict, dias: list, resultado_template: dict, arquivo_config: str):
+def gerar_config(info: dict, dias: list, resultado_template: dict, arquivo_config: str = None):
+    """
+    Monta a geometria do formulário recém-gerado.
+
+    Grava em `arquivo_config` quando informado e sempre devolve o dict — é essa
+    cópia que vai congelada dentro do lote, já que o config_*.yaml em disco é
+    sobrescrito na próxima geração de template.
+    """
     largura_mm, altura_mm = A4[0] / mm, A4[1] / mm
     posicoes = resultado_template["posicoes_circulos"]
 
@@ -459,10 +515,70 @@ def gerar_config(info: dict, dias: list, resultado_template: dict, arquivo_confi
         "restaurante": info["restaurante"],
     }
 
-    with open(arquivo_config, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    if arquivo_config:
+        with open(arquivo_config, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        print(f"Config gerado: {arquivo_config}")
 
-    print(f"Config gerado: {arquivo_config}")
+    return config
+
+
+# --- GERAÇÃO COM SNAPSHOT DE LOTE ---
+
+def gerar_com_lote(info: dict, dias: list, restaurante_key: str,
+                   restaurante_nome: str, aba: str, arquivo_config: str = None):
+    """
+    Gera o PDF e o snapshot do lote na mesma operação.
+
+    Só faz sentido fazer as duas coisas juntas: o snapshot vale exatamente
+    porque é escrito no mesmo instante em que o papel é impresso. Se ele fosse
+    montado depois, voltaria a depender de uma planilha que já mudou — que é o
+    problema que ele existe para resolver.
+
+    Returns:
+        (lote, caminho_pdf)
+    """
+    import lote as lote_mod
+
+    lote_id = lote_mod.novo_lote_id(restaurante_key)
+
+    os.makedirs(lote_mod.LOTES_DIR, exist_ok=True)
+    caminho_pdf = lote_mod.caminho_pdf(lote_id)
+
+    resultado = gerar_template(info, dias, caminho_pdf, lote_id=lote_id)
+    config = gerar_config(info, dias, resultado, arquivo_config)
+
+    validacao = lote_mod.validar_roster(info["alunos"])
+    avisos = list(validacao["avisos"])
+    notas = list(validacao["notas"])
+    for ign in info.get("linhas_ignoradas", []):
+        avisos.append(
+            f"Linha {ign['linha_planilha']} da planilha ignorada "
+            f"({ign['motivo']}, matrícula {ign.get('matricula', '?')})."
+        )
+
+    novo = lote_mod.montar_lote(
+        lote_id=lote_id,
+        restaurante_key=restaurante_key,
+        restaurante_nome=restaurante_nome,
+        aba=aba,
+        dias=dias,
+        paginacao=resultado["paginacao"],
+        config=config,
+        info=info,
+        origem=lote_mod.ORIGEM_GERACAO,
+        avisos=avisos,
+        notas=notas,
+    )
+    lote_mod.salvar_lote(novo)
+
+    print(f"Lote registrado: {lote_id}  ({novo['total_alunos']} alunos)")
+    for aviso in avisos:
+        print(f"  AVISO: {aviso}")
+    for nota in notas:
+        print(f"  nota : {nota}")
+
+    return novo, caminho_pdf
 
 
 # --- EXECUÇÃO ---

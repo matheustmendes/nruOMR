@@ -29,7 +29,11 @@ import numpy as np
 import yaml
 
 from localizar_marcadores import processar
-from ler_bolhas import ler_pagina, THRESHOLD, carregar_posicoes, _get_threshold, _get_offset_y
+from utils import stdout_tolerante
+from ler_bolhas import (
+    ler_pagina, THRESHOLD, carregar_posicoes,
+    _get_threshold, _get_offset_y, get_zona_ambigua,
+)
 from exportar import (
     carregar_todas_paginas, processar_pdf_completo,
     contar_presencas, ler_nomes_alunos, exportar_xlsx, eh_pagina_branca,
@@ -37,9 +41,10 @@ from exportar import (
 )
 from revisar import extrair_recortes, gerar_html_revisao
 from gerar_template import (
-    ler_planilha, gerar_template, gerar_config, CONFIG_ABAS
+    ler_planilha, gerar_template, gerar_config, gerar_com_lote, CONFIG_ABAS
 )
 from google_sheets import exportar_para_sheets
+import lote as lote_mod
 
 
 app = Flask(__name__)
@@ -128,11 +133,15 @@ def rota_processar():
 
         scan_files = request.files.getlist("scan")
         alunos_file = request.files.get("alunos")
+        lote_id = (request.form.get("lote_id") or "").strip()
 
         if not scan_files or not scan_files[0].filename:
-            return jsonify({"erro": "Envie o scan e a planilha de alunos"}), 400
-        if not alunos_file:
-            return jsonify({"erro": "Envie a planilha de alunos"}), 400
+            return jsonify({"erro": "Envie o PDF do scan"}), 400
+        if not lote_id and not alunos_file:
+            return jsonify({
+                "erro": "Selecione o lote impresso que originou este scan "
+                        "(ou, no modo legado, envie a planilha de alunos)."
+            }), 400
 
         # Salva arquivos temporários — fecha imediatamente após salvar (necessário no Windows)
         if len(scan_files) == 1:
@@ -154,20 +163,62 @@ def rota_processar():
                 except Exception:
                     pass
 
-        alunos_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-        alunos_tmp.close()
-        alunos_file.save(alunos_tmp.name)
+        alunos_tmp = None
+        if alunos_file and alunos_file.filename:
+            alunos_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+            alunos_tmp.close()
+            alunos_file.save(alunos_tmp.name)
 
-        # Carrega config
-        caminho_config = encontrar_config(restaurante_key)
-        if not caminho_config:
-            return jsonify({"erro": f"Configuração não encontrada para {RESTAURANTES[restaurante_key]['nome']}. Gere o template primeiro."}), 400
-
-        with open(caminho_config, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-
-        dias = config["layout"]["dias"]
         restaurante = RESTAURANTES[restaurante_key]
+        lote = None
+        avisos_identidade = []
+
+        if lote_id:
+            # Caminho correto: identidade e geometria vêm congeladas do lote
+            # impresso. A planilha atual não entra na resolução de quem é quem.
+            try:
+                lote = lote_mod.carregar_lote(lote_id)
+            except FileNotFoundError as e:
+                return jsonify({"erro": str(e)}), 400
+
+            if lote["restaurante_key"] != restaurante_key:
+                return jsonify({
+                    "erro": f"O lote {lote_id} é de {lote['restaurante_nome']}, "
+                            f"não de {restaurante['nome']}."
+                }), 400
+
+            config = lote["config"]
+            dias = lote["dias"]
+            alunos = lote_mod.roster_do_lote(lote)
+
+            # Os avisos do lote são da hora da impressão e já foram mostrados
+            # ali. Repetir a lista inteira a cada scan vira ruído e esconde os
+            # avisos que importam agora — basta o ponteiro.
+            n_avisos = len(lote.get("avisos", []))
+            if n_avisos:
+                avisos_identidade.append(
+                    f"O lote {lote_id} foi impresso com {n_avisos} pendência(s) "
+                    f"na planilha de origem (matrícula duplicada ou em branco). "
+                    f"Detalhes em: python lote.py ver {lote_id}"
+                )
+        else:
+            # Modo legado: sem lote, a identidade volta a depender da planilha
+            # informada agora — exatamente a origem dos scans trocados. Mantido
+            # só para não travar quem ainda tem folhas impressas antes do lote.
+            caminho_config = encontrar_config(restaurante_key)
+            if not caminho_config:
+                return jsonify({"erro": f"Configuração não encontrada para {RESTAURANTES[restaurante_key]['nome']}. Gere o template primeiro."}), 400
+
+            with open(caminho_config, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f)
+
+            dias = config["layout"]["dias"]
+            alunos = ler_nomes_alunos(alunos_tmp.name, restaurante["aba"])
+            avisos_identidade.append(
+                "Processado SEM lote: os nomes vieram da planilha enviada agora. "
+                "Se ela mudou depois da impressão, as presenças saem trocadas. "
+                "Confira antes de dar como fechado."
+            )
 
         periodo_semana = request.form.get("periodo_semana", "").strip()
         if not periodo_semana:
@@ -192,16 +243,25 @@ def rota_processar():
         resultados, pags_alinhadas, binarios, resultados_por_pag = processar_pdf_completo(
             paginas, config, retornar_imagens=True, pagina_inicial=pagina_inicial
         )
-        alunos = ler_nomes_alunos(alunos_tmp.name, restaurante["aba"])
+        # O lote sabe quantas páginas foram impressas; ler mais do que isso
+        # significa que entrou folha de outro lote no maço.
+        if lote:
+            maior_num = max((r["numero"] for r in resultados), default=0)
+            if maior_num > lote["total_alunos"]:
+                avisos_identidade.append(
+                    f"O scan chegou até a linha {maior_num}, mas o lote {lote_id} "
+                    f"tem {lote['total_alunos']} pessoas em {lote['total_paginas']} "
+                    f"página(s). Confira se não entrou folha de outro lote."
+                )
 
         # Casos ambíguos são contados como presença
         _threshold = _get_threshold(config)
-        _mb = config.get("scan", {}).get("ambiguo_margem_abaixo", 0.04)
+        amb_min, amb_max = get_zona_ambigua(config)
         for r in resultados:
             for dia in dias:
                 for tipo in ["almoco", "janta"]:
                     pct = r["dias"][dia][f"{tipo}_pct"]
-                    if (_threshold - _mb) <= pct < _threshold:
+                    if amb_min <= pct < _threshold:
                         r["dias"][dia][tipo] = True
 
         contagem = contar_presencas(resultados, dias)
@@ -210,25 +270,46 @@ def rota_processar():
         alunos_lidos = len(resultados)
         com_presenca = sum(1 for c in contagem if c["presencas"] > 0)
 
-        _ma = config.get("scan", {}).get("ambiguo_margem_acima", 0.10)
+        total_celulas = max(1, alunos_lidos * len(dias) * 2)
         ambiguos = sum(
             1
             for r in resultados
             for dia in dias
             for tipo in ["almoco", "janta"]
-            if (_threshold - _mb) <= r["dias"][dia][f"{tipo}_pct"] <= (_threshold + _ma)
+            if amb_min <= r["dias"][dia][f"{tipo}_pct"] <= amb_max
         )
+
+        # Ambiguidade generalizada não é caso a caso para revisar — é sinal de
+        # que a leitura inteira está ruim (scan escuro demais, folha torta,
+        # geometria errada). Revisar 200 recortes um a um não conserta isso.
+        if ambiguos > total_celulas * 0.25:
+            avisos_identidade.append(
+                f"{ambiguos} de {total_celulas} marcações caíram na zona de dúvida "
+                f"({ambiguos * 100 // total_celulas}%). Isso indica problema na "
+                "digitalização ou no alinhamento, não dúvidas reais de "
+                "preenchimento — vale reescanear antes de revisar caso a caso."
+            )
 
         # Gera xlsx de saída
         saida_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         saida_tmp.close()
         exportar_xlsx(contagem, alunos, dias, saida_tmp.name)
 
-        # Mantém scan para preview; limpa apenas a planilha de alunos
-        try:
-            os.unlink(alunos_tmp.name)
-        except Exception:
-            pass
+        # Com lote, a planilha enviada (se houver) serve só para mostrar o que
+        # mudou desde a impressão — nunca para decidir quem é quem.
+        divergencia = None
+        if lote and alunos_tmp:
+            try:
+                atuais = ler_nomes_alunos(alunos_tmp.name, restaurante["aba"])
+                divergencia = lote_mod.comparar_com_planilha(lote, atuais)
+            except Exception as e:
+                print(f"  Aviso: não foi possível comparar com a planilha enviada: {e}")
+
+        if alunos_tmp:
+            try:
+                os.unlink(alunos_tmp.name)
+            except Exception:
+                pass
 
         # Exporta para Google Sheets (não bloqueia em caso de falha)
         resultado_sheets = exportar_para_sheets(
@@ -246,6 +327,17 @@ def rota_processar():
         else:
             sheets_resp = {"sheets_status": "erro", "sheets_erro": resultado_sheets.get("erro", "")}
 
+        # Registra no lote o que aconteceu. Ele só sai da pasta ativa quando o
+        # Sheets confirmou de verdade — se falhou, continua disponível para
+        # reprocessar sem reescanear a folha.
+        if lote:
+            lote_mod.registrar_processamento(
+                lote_id,
+                periodo_semana,
+                sincronizado_sheets=bool(resultado_sheets.get("ok")),
+                detalhe=sheets_resp.get("sheets_erro", ""),
+            )
+
         # Guarda caminho pra download e dados de preview
         app.config["ULTIMO_RESULTADO"] = saida_tmp.name
         app.config["ULTIMO_NOME"] = f"presencas_{restaurante_key}.xlsx"
@@ -260,6 +352,7 @@ def rota_processar():
             "config": config,
             "dias": dias,
             "restaurante_key": restaurante_key,
+            "lote_id": lote_id or None,
         }
 
         return jsonify({
@@ -269,6 +362,16 @@ def rota_processar():
             "ambiguos": ambiguos,
             "paginas": len(paginas),
             "paginas_validas": len(pags_alinhadas),
+            "modo": "lote" if lote else "legado",
+            "lote_id": lote_id or "",
+            "lote_datas": lote.get("datas", "") if lote else "",
+            "avisos": avisos_identidade,
+            "divergencia": divergencia and {
+                "resumo": divergencia["resumo"],
+                "deslocados": len(divergencia["deslocados"]),
+                "removidos": len(divergencia["removidos"]),
+                "novos": len(divergencia["novos"]),
+            },
             **sheets_resp,
         })
 
@@ -337,22 +440,25 @@ def rota_gerar_template():
                 else:
                     dias = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"]
 
-                # PDF temporário
-                pdf_tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-                pdf_tmp.close()
-                resultado = gerar_template(info, dias, pdf_tmp.name)
-
-                # Config no diretório do script
+                # Config no diretório do script (mantido para as ferramentas
+                # de diagnóstico; a cópia que vale no processamento é a que vai
+                # congelada dentro do lote)
                 config_path = os.path.join(SCRIPT_DIR, "configs", rest["config"])
                 if not os.path.isdir(os.path.join(SCRIPT_DIR, "configs")):
                     config_path = os.path.join(SCRIPT_DIR, rest["config"])
-                gerar_config(info, dias, resultado, config_path)
+
+                # O PDF e o snapshot nascem juntos e ficam guardados em lotes/.
+                novo_lote, caminho_pdf = gerar_com_lote(
+                    info, dias, key, rest["nome"], rest["aba"], config_path
+                )
 
                 resultados_geracao.append({
                     "restaurante": rest["nome"],
-                    "alunos": len(info["alunos"]),
-                    "paginas": resultado["total_paginas"],
-                    "arquivo": pdf_tmp.name,
+                    "alunos": novo_lote["total_alunos"],
+                    "paginas": novo_lote["total_paginas"],
+                    "arquivo": caminho_pdf,
+                    "lote_id": novo_lote["lote_id"],
+                    "avisos": novo_lote["avisos"],
                 })
 
             except Exception as e:
@@ -368,13 +474,8 @@ def rota_gerar_template():
 
         pdfs_ok = [r for r in resultados_geracao if "arquivo" in r]
         if pdfs_ok:
-            # Sempre indexa por restaurante para o /download/<restaurante> funcionar
-            app.config["TEMPLATES_GERADOS"] = {
-                r["restaurante"].lower().replace(" ", "_").replace("ã", "a").replace("á", "a"): r["arquivo"]
-                for r in pdfs_ok
-            }
             app.config["ULTIMO_RESULTADO"] = pdfs_ok[0]["arquivo"]
-            app.config["ULTIMO_NOME"] = f"template_{keys[0]}.pdf"
+            app.config["ULTIMO_NOME"] = f"{pdfs_ok[0]['lote_id']}.pdf"
 
         return jsonify({
             "sucesso": True,
@@ -382,6 +483,8 @@ def rota_gerar_template():
                 "restaurante": r["restaurante"],
                 "alunos": r.get("alunos", 0),
                 "paginas": r.get("paginas", 0),
+                "lote_id": r.get("lote_id", ""),
+                "avisos": r.get("avisos", []),
                 "erro": r.get("erro"),
             } for r in resultados_geracao],
         })
@@ -432,19 +535,39 @@ def rota_aplicar_correcoes():
         app.config["ULTIMO_RESULTADO"] = saida_tmp.name
         app.config["ULTIMO_NOME"] = f"presencas_{dados['restaurante_key']}.xlsx"
 
+        # A revisão manual é a palavra final: ela tem que reescrever o Sheets,
+        # não só o xlsx local. Uma falha aqui precisa aparecer — engolir a
+        # exceção deixava o operador achando que a correção tinha subido.
         periodo = app.config.get("ULTIMO_PERIODO")
         sheets_resp = {}
         if periodo:
             try:
-                resultado_sheets = exportar_para_sheets(
+                sheets_resp = exportar_para_sheets(
                     contagem, dados["alunos"], dados["dias"],
                     dados["restaurante_key"], periodo, forcar=True,
                 )
-                sheets_resp = resultado_sheets
-            except Exception:
-                pass
+            except Exception as e:
+                traceback.print_exc()
+                sheets_resp = {"ok": False, "erro": str(e)}
 
-        return jsonify({"sucesso": True, **sheets_resp})
+            if dados.get("lote_id"):
+                lote_mod.registrar_processamento(
+                    dados["lote_id"], periodo,
+                    sincronizado_sheets=bool(sheets_resp.get("ok")),
+                    detalhe="revisão manual aplicada",
+                )
+        else:
+            sheets_resp = {
+                "ok": False,
+                "erro": "Nenhum período em memória — correções salvas apenas no xlsx.",
+            }
+
+        return jsonify({
+            "sucesso": True,
+            "sheets_ok": bool(sheets_resp.get("ok")),
+            "sheets_erro": sheets_resp.get("erro", ""),
+            "sheets_aba": sheets_resp.get("aba", ""),
+        })
     except Exception as e:
         traceback.print_exc()
         return jsonify({"erro": str(e)}), 500
@@ -465,6 +588,13 @@ def rota_sheets_exportar():
             dados["restaurante_key"], periodo, forcar=True,
         )
 
+        if dados.get("lote_id"):
+            lote_mod.registrar_processamento(
+                dados["lote_id"], periodo,
+                sincronizado_sheets=bool(resultado.get("ok")),
+                detalhe="substituição manual da semana",
+            )
+
         if resultado.get("ok"):
             return jsonify({"sucesso": True, "aba": resultado.get("aba", "")})
         else:
@@ -484,13 +614,27 @@ def rota_download():
     return send_file(caminho, as_attachment=True, download_name=nome)
 
 
-@app.route("/download/<restaurante>")
-def rota_download_template(restaurante):
-    templates = app.config.get("TEMPLATES_GERADOS", {})
-    caminho = templates.get(restaurante)
-    if not caminho or not os.path.exists(caminho):
-        return "Template não encontrado", 404
-    return send_file(caminho, as_attachment=True, download_name=f"template_{restaurante}.pdf")
+@app.route("/lotes")
+def rota_lotes():
+    """Lotes disponíveis para processar, mais recentes primeiro."""
+    restaurante_key = request.args.get("restaurante") or None
+    itens = lote_mod.listar_lotes(restaurante_key, limite=60)
+    return jsonify({"lotes": itens})
+
+
+@app.route("/lote/<lote_id>/pdf")
+def rota_download_lote(lote_id):
+    """
+    Reimprime o lote exatamente como saiu da primeira vez.
+
+    Guardar o PDF junto do snapshot é o que impede o problema de voltar: se a
+    folha física sumir ou vier rasgada, dá para reimprimir a mesma lista, na
+    mesma ordem, sem passar de novo pela planilha viva.
+    """
+    caminho = lote_mod.caminho_pdf(lote_id)
+    if not os.path.exists(caminho):
+        return "PDF deste lote não está guardado", 404
+    return send_file(caminho, as_attachment=True, download_name=f"{lote_id}.pdf")
 
 
 @app.route("/preview/<int:idx>")
@@ -521,9 +665,7 @@ def rota_preview(idx):
         verde = (0, 200, 0)
         azul = (0, 0, 180)
         amarelo = (0, 200, 255)
-        scan_cfg = config.get("scan", {})
-        mb = scan_cfg.get("ambiguo_margem_abaixo", 0.04)
-        ma = scan_cfg.get("ambiguo_margem_acima", 0.10)
+        amb_min, amb_max = get_zona_ambigua(config)
 
         for local_i, aluno in enumerate(resultados):
             cy = int(pos["primeira_linha_y_px"] + offset_y + local_i * pos["linha_altura_px"])
@@ -535,9 +677,9 @@ def rota_preview(idx):
                     cx = int(cx_float)
                     pct = aluno["dias"][dia][f"{tipo}_pct"]
 
-                    if pct >= threshold + ma:
+                    if pct > amb_max:
                         cor = verde
-                    elif pct < threshold - mb:
+                    elif pct < amb_min:
                         cor = azul
                     else:
                         cor = amarelo
@@ -1073,19 +1215,43 @@ body {
             </div>
 
             <div class="section">
-                <div class="label">Planilha de alunos (.xlsx)</div>
-                <div id="upload-alunos-zone" class="upload-zone">
-                    <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'alunos')">
-                    <div class="upload-icon">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
-                    </div>
-                    <div class="upload-text">Arraste o arquivo ou clique para selecionar</div>
-                    <div class="upload-hint">.xlsx exportado do Google Sheets</div>
+                <div class="label">Lote impresso que originou este scan</div>
+                <select id="select-lote" onchange="onLoteChange()"
+                        style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;background:#fff;">
+                    <option value="">Carregando lotes...</option>
+                </select>
+                <div id="lote-detalhe" style="font-size:12px;color:#888;margin-top:6px;"></div>
+                <div class="upload-hint" style="margin-top:6px;">
+                    O lote guarda quem estava em cada linha no dia da impressão.
+                    É ele que garante que a presença vá para a pessoa certa mesmo
+                    que a planilha tenha mudado depois. O código do lote está
+                    impresso no rodapé da folha.
                 </div>
-                <div id="file-alunos" class="file-pill" style="display:none;">
-                    <div class="file-icon">XLS</div>
-                    <div class="file-name" id="file-alunos-name"></div>
-                    <div class="file-remove" onclick="removeFile('alunos')">remover</div>
+            </div>
+
+            <div class="section">
+                <div style="font-size:12px;color:#999;cursor:pointer;user-select:none;"
+                     onclick="toggleLegado()" id="legado-toggle">▸ Folha antiga, sem código de lote?</div>
+                <div id="legado-box" style="display:none;margin-top:10px;">
+                    <div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;padding:10px 12px;font-size:12px;color:#7a5a10;margin-bottom:10px;">
+                        Sem lote, os nomes voltam a sair da planilha enviada agora.
+                        Se ela mudou desde a impressão, as presenças saem trocadas.
+                        Prefira reconstruir o lote com <code>recuperar_lote.py</code>.
+                    </div>
+                    <div class="label">Planilha de alunos (.xlsx)</div>
+                    <div id="upload-alunos-zone" class="upload-zone">
+                        <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'alunos')">
+                        <div class="upload-icon">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
+                        </div>
+                        <div class="upload-text">Arraste o arquivo ou clique para selecionar</div>
+                        <div class="upload-hint">.xlsx exportado do Google Sheets</div>
+                    </div>
+                    <div id="file-alunos" class="file-pill" style="display:none;">
+                        <div class="file-icon">XLS</div>
+                        <div class="file-name" id="file-alunos-name"></div>
+                        <div class="file-remove" onclick="removeFile('alunos')">remover</div>
+                    </div>
                 </div>
             </div>
 
@@ -1124,10 +1290,15 @@ body {
                 <span class="result-label">Casos ambíguos</span>
                 <span class="result-value" id="r-ambiguos"></span>
             </div>
+            <div class="result-row" id="lote-row" style="display:none;">
+                <span class="result-label">Lote usado</span>
+                <span class="result-value" id="r-lote"></span>
+            </div>
             <div class="result-row" id="sheets-row" style="display:none;">
                 <span class="result-label">Google Sheets</span>
                 <span class="result-value" id="sheets-msg"></span>
             </div>
+            <div id="avisos-box" style="display:none;margin-top:10px;"></div>
             <a href="/download" class="btn-download" id="btn-download-proc">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v12m0 0l4-4m-4 4l-4-4M4 18h16"/></svg>
                 <span id="download-nome">Baixar planilha</span>
@@ -1184,6 +1355,10 @@ function selectRadio(el, name) {
         if (!isFdsEsp) {
             document.querySelectorAll('#dias-especial-group .radio').forEach(function(d) { d.classList.remove('selected'); });
         }
+    }
+
+    if (name === 'rest-processar') {
+        carregarLotes();
     }
 }
 
@@ -1337,12 +1512,20 @@ function submitTemplate(e) {
                 if (r.erro) {
                     html += '<div class="template-item"><span>' + r.restaurante + '</span><span style="color:#e55;">' + r.erro + '</span></div>';
                 } else {
-                    var key = r.restaurante.toLowerCase().replace(/ /g, '_').replace(/ã/g, 'a').replace(/á/g, 'a');
-                    html += '<div class="template-item"><div><div>' + r.restaurante + '</div><div class="template-info">' + r.alunos + ' alunos, ' + r.paginas + ' páginas</div></div><a href="/download/' + key + '" class="template-download">baixar PDF</a></div>';
+                    html += '<div class="template-item"><div><div>' + r.restaurante + '</div>' +
+                            '<div class="template-info">' + r.alunos + ' alunos, ' + r.paginas + ' páginas</div>' +
+                            '<div class="template-info" style="font-family:monospace;">lote ' + r.lote_id + '</div>' +
+                            '</div><a href="/lote/' + r.lote_id + '/pdf" class="template-download">baixar PDF</a></div>';
+                    (r.avisos || []).forEach(function(a) {
+                        html += '<div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;' +
+                                'padding:9px 12px;font-size:12px;color:#7a5a10;margin-top:6px;">' + a + '</div>';
+                    });
                 }
             });
 
             document.getElementById('result-template').innerHTML = html;
+            // O lote recém-criado precisa aparecer na aba de processar sem F5.
+            carregarLotes();
         })
         .catch(err => {
             showLoading('template', false);
@@ -1350,6 +1533,88 @@ function submitTemplate(e) {
         });
 
     return false;
+}
+
+var lotesCarregados = [];
+
+function carregarLotes() {
+    var sel = document.getElementById('select-lote');
+    if (!sel) return;
+    var rest = document.querySelector('input[name="rest-processar"]:checked').value;
+    sel.innerHTML = '<option value="">Carregando...</option>';
+    document.getElementById('lote-detalhe').textContent = '';
+
+    fetch('/lotes?restaurante=' + encodeURIComponent(rest))
+        .then(r => r.json())
+        .then(data => {
+            lotesCarregados = data.lotes || [];
+            if (!lotesCarregados.length) {
+                sel.innerHTML = '<option value="">Nenhum lote impresso para este restaurante</option>';
+                document.getElementById('lote-detalhe').innerHTML =
+                    '<span style="color:#b57c10;">Gere o template por aqui para que o lote passe a ser registrado.</span>';
+                return;
+            }
+            var html = '<option value="">- selecione o lote -</option>';
+            lotesCarregados.forEach(function(l) {
+                var rotulo = (l.datas || l.criado_em.slice(0, 10)) +
+                             '  |  ' + l.total_alunos + ' alunos' +
+                             '  |  ' + l.lote_id;
+                if (l.processado) rotulo += '  (ja processado)';
+                if (l.origem !== 'geracao') rotulo += '  [' + l.origem + ']';
+                html += '<option value="' + l.lote_id + '">' + rotulo + '</option>';
+            });
+            sel.innerHTML = html;
+            // Um unico lote ativo quase sempre e o certo - pre-seleciona.
+            var ativos = lotesCarregados.filter(function(l) { return !l.processado; });
+            if (ativos.length === 1) {
+                sel.value = ativos[0].lote_id;
+                onLoteChange();
+            }
+        })
+        .catch(function() {
+            sel.innerHTML = '<option value="">Erro ao listar lotes</option>';
+        });
+}
+
+function onLoteChange() {
+    var sel = document.getElementById('select-lote');
+    var det = document.getElementById('lote-detalhe');
+    var l = lotesCarregados.filter(function(x) { return x.lote_id === sel.value; })[0];
+    if (!l) { det.textContent = ''; return; }
+
+    var txt = l.total_alunos + ' pessoas em ' + l.total_paginas + ' pagina(s) - dias: ' +
+              (l.dias || []).join(', ') + ' - impresso em ' + l.criado_em.replace('T', ' ');
+    if (l.tem_pdf) {
+        txt += ' - <a href="/lote/' + l.lote_id + '/pdf" target="_blank" style="color:#666;">reimprimir</a>';
+    }
+    if (l.processado) {
+        txt += '<br><span style="color:#b57c10;">Este lote ja foi processado e sincronizado. ' +
+               'Processar de novo vai sobrescrever a semana no Sheets.</span>';
+    }
+    (l.avisos || []).forEach(function(a) {
+        txt += '<br><span style="color:#b57c10;">' + a + '</span>';
+    });
+    det.innerHTML = txt;
+}
+
+function toggleLegado() {
+    var box = document.getElementById('legado-box');
+    var tog = document.getElementById('legado-toggle');
+    var aberto = box.style.display !== 'none';
+    box.style.display = aberto ? 'none' : '';
+    tog.textContent = (aberto ? '\u25b8' : '\u25be') + ' Folha antiga, sem codigo de lote?';
+}
+
+function mostrarAvisos(avisos) {
+    var box = document.getElementById('avisos-box');
+    if (!avisos || !avisos.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    var html = '';
+    avisos.forEach(function(a) {
+        html += '<div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;' +
+                'padding:9px 12px;font-size:12px;color:#7a5a10;margin-top:6px;">' + a + '</div>';
+    });
+    box.innerHTML = html;
+    box.style.display = '';
 }
 
 function submitProcessar(e) {
@@ -1362,13 +1627,18 @@ function submitProcessar(e) {
     var alunos = form.querySelector('input[name="alunos"]');
     var periodo = form.querySelector('input[name="periodo_semana"]').value.trim();
     var paginaInicial = form.querySelector('input[name="pagina_inicial"]').value.trim();
+    var loteId = document.getElementById('select-lote').value;
 
     if (!scanFiles.length) { showError('processar', 'Selecione o PDF do scan.'); return false; }
-    if (!alunos.files.length) { showError('processar', 'Selecione a planilha de alunos.'); return false; }
+    if (!loteId && !alunos.files.length) {
+        showError('processar', 'Selecione o lote impresso deste scan — ou, se a folha for anterior aos lotes, abra "Folha antiga" e envie a planilha.');
+        return false;
+    }
     if (!periodo) { showError('processar', 'Informe o período da semana (ex: 05/05 a 09/05).'); return false; }
 
     scanFiles.forEach(function(f) { data.append('scan', f); });
-    data.set('alunos', alunos.files[0]);
+    if (loteId) data.set('lote_id', loteId);
+    if (alunos.files.length) data.set('alunos', alunos.files[0]);
     data.set('periodo_semana', periodo);
     data.set('pagina_inicial', paginaInicial || '1');
 
@@ -1387,6 +1657,24 @@ function submitProcessar(e) {
 
             document.getElementById('r-alunos').textContent = data.alunos;
             document.getElementById('r-presenca').textContent = data.com_presenca;
+
+            var loteRow = document.getElementById('lote-row');
+            var loteVal = document.getElementById('r-lote');
+            loteRow.style.display = '';
+            if (data.modo === 'lote') {
+                loteVal.textContent = data.lote_id + (data.lote_datas ? ' (' + data.lote_datas + ')' : '');
+                loteVal.className = 'result-value result-ok';
+            } else {
+                loteVal.textContent = 'nenhum — identidade veio da planilha enviada';
+                loteVal.className = 'result-value result-warn';
+            }
+
+            var avisos = (data.avisos || []).slice();
+            if (data.divergencia && data.divergencia.resumo) {
+                avisos.push('Comparado com a planilha enviada: ' + data.divergencia.resumo +
+                            '. As presenças foram atribuídas pelo lote impresso, não por ela.');
+            }
+            mostrarAvisos(avisos);
 
             var ambEl = document.getElementById('r-ambiguos');
             ambEl.textContent = data.ambiguos + (data.ambiguos > 0 ? ' (incluídos como presença)' : '');
@@ -1535,6 +1823,8 @@ document.querySelectorAll('.upload-zone:not(#upload-scan-zone)').forEach(functio
     });
 });
 
+carregarLotes();
+
 // Drag visual (hover) para a zona do scan
 document.getElementById('upload-scan-zone').addEventListener('dragover', function(e) {
     e.preventDefault();
@@ -1550,6 +1840,8 @@ document.getElementById('upload-scan-zone').addEventListener('dragleave', functi
 
 
 if __name__ == "__main__":
+    stdout_tolerante()
+
     port = 5000
     print()
     print("=" * 50)

@@ -351,15 +351,19 @@ def main():
         ("6 — Mapa de bolhas  [verde=marcado | azul=vazio | amarelo=marcado mas fraco]", vis_bolhas),
     ]
     if hist is not None:
+        # O corte efetivo depende do modo de medição do config, não da
+        # constante do módulo — desenhar 0,40 num scan lido no modo interior
+        # colocaria a linha vermelha longe de onde a decisão realmente ocorre.
         pares.append((
-            f"7 — Histograma de preenchimento  [threshold={THRESHOLD:.2f} em vermelho]",
+            f"7 — Histograma de preenchimento  "
+            f"[threshold={_get_threshold(config):.2f} em vermelho]",
             hist
         ))
     mostrar_no_navegador(*pares)
 
     print(f"\n{'='*50}")
     print(f"  Visualização aberta no navegador.")
-    print(f"  Se houver muitos amarelos -> ajuste THRESHOLD em ler_bolhas.py")
+    print(f"  Se houver muitos amarelos -> ajuste scan.threshold no config do lote")
     print(f"  Se marcadores falharem   -> rode localizar_marcadores.py pra diagnóstico")
     print(f"{'='*50}\n")
 

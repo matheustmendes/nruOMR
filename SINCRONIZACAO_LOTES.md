@@ -1,8 +1,74 @@
-# Sincronização de lotes entre máquinas — problema em aberto
+# Sincronização de lotes entre máquinas
 
-> Documento de continuidade. Escrito para retomar o desenvolvimento depois —
-> não é um plano fechado, é o registro do problema, do porquê ele existe na
-> arquitetura atual, e das opções para resolver. Nada aqui foi implementado.
+> Documento de continuidade — registra o problema, o porquê ele existe na
+> arquitetura atual, as opções consideradas e a decisão tomada.
+
+## Status: implementado e ativo (opção B — Google Sheets como banco do lote)
+
+Decisão (sessão de 2026-09-10): mais de 3 máquinas/unidades envolvidas,
+conta Google da PROAE mas fora de um Workspace institucional,
+sincronização sob demanda (não precisa tempo real).
+
+**A escolha inicial foi a opção C (Drive API) e foi abandonada em cima de
+um teste real, não de teoria.** Compartilhar uma pasta do Drive como
+Editor com a conta de serviço resolve leitura/listagem, mas **criar um
+arquivo novo** nela sempre tenta alocar a cota de armazenamento da própria
+conta de serviço — e ela não tem nenhuma fora de um Workspace. Erro real
+recebido ao tentar:
+
+```
+Service Accounts do not have storage quota. Leverage shared drives, or
+use OAuth delegation instead.
+```
+
+As duas saídas que o próprio erro sugere ("shared drives" e "OAuth
+delegation") exigem Google Workspace administrado, que este ambiente não
+tem. Ou seja: upload direto pela conta de serviço não é viável aqui,
+não importa como a pasta seja configurada — não é um problema de setup,
+é um limite estrutural da opção C neste ambiente.
+
+**A opção B não tem esse problema** porque nunca cria um arquivo novo: só
+escreve células numa planilha que já existe e já pertence a uma conta
+humana (a cota é dela). É por isso que o Sheets já funcionava para a
+exportação de presenças o tempo todo, sem nunca esbarrar nisso.
+
+**O que mudou no código:** módulo `lote_sync.py` (Sheets, não Drive —
+`lote_drive.py` foi removido), reaproveitando a mesma planilha do
+dashboard (`dashboard_spreadsheet_id`, já compartilhada como Editor com o
+service account) numa aba nova ("lotes_sync", criada automaticamente na
+primeira sincronização) — **nenhuma configuração adicional foi
+necessária**, ao contrário da tentativa com Drive. `lote.py` chama
+`lote_sync` de forma best-effort em `salvar_lote`, `carregar_lote` (cai
+pra planilha se não achar localmente), `listar_lotes` (mescla o que só
+existe na planilha) e `registrar_processamento` (marca o lote como
+processado remotamente). Nenhum outro arquivo mudou — `web.py`,
+`recuperar_lote.py`, `corrigir_passivo.py` e `gerar_template.py` continuam
+chamando só as funções de `lote.py`.
+
+**Limitação aceita: o PDF não sincroniza.** Só cabe bem numa célula de
+planilha um blob pequeno, e um PDF de várias páginas não é isso de forma
+confiável. Só o roster/geometria (o JSON) sincroniza — é ele que resolve o
+bug de identidade entre máquinas, que é o problema original deste
+documento. Reimprimir o PDF exato continua funcionando só na máquina que
+gerou o lote (mesma limitação que já existia antes desta sincronização;
+`recuperar_lote.py` continua sendo o caminho de recuperação nos outros
+casos).
+
+Enquanto `lotes_sincronizacao`/`dashboard_spreadsheet_id` (em
+`config_sheets.yaml`) não resolverem nenhum spreadsheet_id, o sistema roda
+100% local, como antes — a sincronização é opt-in.
+
+**Testado de ponta a ponta contra a planilha real** (não só mockado):
+`enviar`, `listar`, `baixar_json` e `marcar_processado` confirmados
+funcionando contra `dashboard_spreadsheet_id`, linha de teste removida
+depois. Suíte completa (`pytest tests/`, 168 testes, incluindo os novos de
+sincronização com `lote_sync` mockado) passando em ~2.7s — nenhum teste
+toca a rede por padrão (fixture `_sincronizacao_desligada_por_padrao` em
+`tests/test_lote.py`).
+
+Sobra sem uso: a pasta do Drive criada na tentativa com a opção C (ID
+`1k57h_aeQPKquanb7JeizdW_3XkHKDXHj`) não é mais referenciada por nada —
+pode ser removida quando quiser, não é urgente.
 
 ## O problema, em uma frase
 

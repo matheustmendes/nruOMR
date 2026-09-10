@@ -27,6 +27,18 @@ from ler_bolhas import ler_circulo, get_zona_ambigua
 DIAS = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"]
 
 
+@pytest.fixture(autouse=True)
+def _sincronizacao_desligada_por_padrao(monkeypatch):
+    """
+    Os testes não podem depender do config_sheets.yaml real da máquina nem
+    tocar a rede — isso faria os testes lerem a planilha de verdade e
+    escreverem lotes de teste nela. Por padrão a sincronização fica
+    "indisponível"; TestSincronizacaoEntreMaquinas liga explicitamente onde
+    precisa.
+    """
+    monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -288,6 +300,121 @@ class TestCicloDeVida:
             "teste_20260101-000000", "x", False, arquivar=True
         )
         assert lote_mod.limpar_antigos(dias_retencao=0, aplicar=True) == []
+
+
+# ---------------------------------------------------------------------------
+# Sincronização entre máquinas (lote_sync é sempre mockado — nenhum destes
+# testes toca a rede; ver SINCRONIZACAO_LOTES.md para o que isso resolve)
+# ---------------------------------------------------------------------------
+
+class TestSincronizacaoEntreMaquinas:
+
+    @pytest.fixture(autouse=True)
+    def _pastas_temporarias(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(lote_mod, "LOTES_DIR", str(tmp_path / "lotes"))
+        monkeypatch.setattr(lote_mod, "PROCESSADOS_DIR", str(tmp_path / "lotes" / "processados"))
+
+    def test_salvar_nao_propaga_erro_da_sincronizacao(self, monkeypatch):
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+
+        def _falha(*a, **k):
+            raise RuntimeError("planilha fora do ar")
+        monkeypatch.setattr(lote_mod.lote_sync, "enviar", _falha)
+
+        caminho = lote_mod.salvar_lote(_lote(PESSOAS))
+        assert os.path.exists(caminho)
+
+    def test_carregar_nao_toca_sincronizacao_quando_existe_localmente(self, monkeypatch):
+        lote_mod.salvar_lote(_lote(PESSOAS))
+
+        def _falha(*a, **k):
+            raise AssertionError("não devia ter chamado a sincronização")
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", _falha)
+
+        recarregado = lote_mod.carregar_lote("teste_20260101-000000")
+        assert recarregado["total_alunos"] == 4
+
+    def test_carregar_cai_para_a_planilha_quando_nao_existe_localmente(self, monkeypatch):
+        remoto = _lote(PESSOAS, lote_id="outra_maquina_20260101-000000")
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+        monkeypatch.setattr(lote_mod.lote_sync, "baixar_json", lambda lote_id: remoto)
+
+        recarregado = lote_mod.carregar_lote("outra_maquina_20260101-000000")
+        assert recarregado["total_alunos"] == 4
+
+        # e passa a existir localmente, como se sempre tivesse existido aqui
+        caminho = os.path.join(lote_mod.LOTES_DIR, "outra_maquina_20260101-000000.json")
+        assert os.path.exists(caminho)
+
+    def test_carregar_levanta_erro_quando_nao_existe_em_lugar_nenhum(self, monkeypatch):
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+        monkeypatch.setattr(lote_mod.lote_sync, "baixar_json", lambda lote_id: None)
+
+        with pytest.raises(FileNotFoundError):
+            lote_mod.carregar_lote("inexistente_20260101-000000")
+
+    def test_listar_mescla_lote_que_so_existe_na_planilha(self, monkeypatch):
+        lote_mod.salvar_lote(_lote(PESSOAS, lote_id="local_20260101-000000"))
+
+        remoto = {
+            "lote_id": "remoto_20260102-000000", "restaurante_key": "canela",
+            "restaurante_nome": "Canela", "criado_em": "2026-01-02T00:00:00",
+            "datas": "12/01 a 16/01", "mes_ano": "Janeiro 2026", "dias": [],
+            "total_alunos": 4, "total_paginas": 2, "origem": "geracao",
+            "avisos": [], "notas": [], "processado": False,
+            "processamentos": [], "tem_pdf": True, "local": False,
+        }
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+        monkeypatch.setattr(lote_mod.lote_sync, "listar", lambda rk=None: [remoto])
+
+        por_id = {l["lote_id"]: l for l in lote_mod.listar_lotes("canela")}
+        assert set(por_id) == {"local_20260101-000000", "remoto_20260102-000000"}
+        assert por_id["remoto_20260102-000000"]["local"] is False
+
+    def test_listar_nao_duplica_lote_que_ja_existe_localmente(self, monkeypatch):
+        lote_mod.salvar_lote(_lote(PESSOAS, lote_id="teste_20260101-000000"))
+
+        remoto = {
+            "lote_id": "teste_20260101-000000", "restaurante_key": "canela",
+            "restaurante_nome": "Canela", "criado_em": "2026-01-01T00:00:00",
+            "datas": "05/05 a 09/05", "mes_ano": "Maio 2026", "dias": [],
+            "total_alunos": 4, "total_paginas": 2, "origem": "geracao",
+            "avisos": [], "notas": [], "processado": False,
+            "processamentos": [], "tem_pdf": True, "local": False,
+        }
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+        monkeypatch.setattr(lote_mod.lote_sync, "listar", lambda rk=None: [remoto])
+
+        itens = lote_mod.listar_lotes("canela")
+        assert len([i for i in itens if i["lote_id"] == "teste_20260101-000000"]) == 1
+
+    def test_registrar_processamento_marca_na_planilha(self, monkeypatch):
+        lote_mod.salvar_lote(_lote(PESSOAS))
+        chamadas = []
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+        monkeypatch.setattr(
+            lote_mod.lote_sync, "marcar_processado",
+            lambda lote_id, sinc: chamadas.append((lote_id, sinc)),
+        )
+
+        lote_mod.registrar_processamento(
+            "teste_20260101-000000", "05/05 a 09/05", sincronizado_sheets=True
+        )
+        assert chamadas == [("teste_20260101-000000", True)]
+
+    def test_erro_ao_marcar_na_planilha_nao_impede_o_arquivamento_local(self, monkeypatch):
+        lote_mod.salvar_lote(_lote(PESSOAS))
+        monkeypatch.setattr(lote_mod.lote_sync, "disponivel", lambda: True)
+
+        def _falha(*a, **k):
+            raise RuntimeError("planilha fora do ar")
+        monkeypatch.setattr(lote_mod.lote_sync, "marcar_processado", _falha)
+
+        lote_mod.registrar_processamento(
+            "teste_20260101-000000", "05/05 a 09/05", sincronizado_sheets=True
+        )
+        arquivado = os.path.join(lote_mod.PROCESSADOS_DIR, "teste_20260101-000000.json")
+        assert os.path.exists(arquivado)
 
 
 # ---------------------------------------------------------------------------

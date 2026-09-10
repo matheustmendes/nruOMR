@@ -45,6 +45,7 @@ from gerar_template import (
 )
 from google_sheets import exportar_para_sheets
 import lote as lote_mod
+import corrigir_passivo
 
 
 app = Flask(__name__)
@@ -631,10 +632,90 @@ def rota_download_lote(lote_id):
     folha física sumir ou vier rasgada, dá para reimprimir a mesma lista, na
     mesma ordem, sem passar de novo pela planilha viva.
     """
-    caminho = lote_mod.caminho_pdf(lote_id)
-    if not os.path.exists(caminho):
+    caminho = lote_mod.garantir_pdf_local(lote_id)
+    if not caminho:
         return "PDF deste lote não está guardado", 404
     return send_file(caminho, as_attachment=True, download_name=f"{lote_id}.pdf")
+
+
+@app.route("/recuperar_lotes", methods=["POST"])
+def rota_recuperar_lotes():
+    """
+    Recupera o lote (roster) de scans já impressos e preenchidos que não têm
+    lote localmente — casando cada scan com seu template pelo período (mesma
+    lógica de corrigir_passivo.py, já testada) e caindo para OCR do scan
+    quando não há template. Não grava nada no Sheets: só cria o lote, que
+    depois é processado normalmente pela aba "Processar scan".
+    """
+    dados = request.get_json(silent=True) or request.form
+    pasta_scans = (dados.get("pasta_scans") or "").strip()
+    pasta_templates = (dados.get("pasta_templates") or "").strip()
+    restaurante_filtro = (dados.get("restaurante") or "").strip() or None
+
+    if not pasta_scans or not os.path.isdir(pasta_scans):
+        return jsonify({"erro": "Pasta de scans não encontrada."}), 400
+    if pasta_templates and not os.path.isdir(pasta_templates):
+        return jsonify({"erro": "Pasta de templates não encontrada."}), 400
+
+    try:
+        grupos = corrigir_passivo._agrupar_scans(pasta_scans)
+        templates = (corrigir_passivo._indexar_pdfs(pasta_templates, exigir_formulario=True)
+                     if pasta_templates else [])
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"erro": f"Falha ao ler as pastas: {e}"}), 500
+
+    resultados = []
+    for (restaurante_key, periodo), grupo in grupos.items():
+        if restaurante_filtro and restaurante_key != restaurante_filtro:
+            continue
+
+        nome_rest = RESTAURANTES.get(restaurante_key, {}).get("nome", restaurante_key)
+        item = {"restaurante": nome_rest, "periodo": periodo}
+
+        if grupo.get("paginas_faltando"):
+            item["status"] = "incompleto"
+            item["detalhe"] = (
+                f"Faltam as páginas {sorted(grupo['paginas_faltando'])} do maço "
+                "— reescaneie antes de recuperar (senão a presença de quem "
+                "estava nessas páginas se perde)."
+            )
+            resultados.append(item)
+            continue
+
+        template_pdf = (corrigir_passivo._melhor_arquivo(templates, restaurante_key, periodo)
+                         if templates else None)
+        linha = {
+            "restaurante": restaurante_key,
+            "periodo": periodo,
+            "template_pdf": template_pdf or "",
+            "scan_pdf": corrigir_passivo.SEPARADOR_SCANS.join(grupo["arquivos"]),
+            "lote_id": "",
+        }
+
+        try:
+            lote_id, origem = corrigir_passivo._obter_lote(linha, None)
+        except Exception as e:
+            item["status"] = "erro"
+            item["detalhe"] = str(e)
+            resultados.append(item)
+            continue
+
+        lote = lote_mod.carregar_lote(lote_id)
+        item["lote_id"] = lote_id
+        item["total_alunos"] = lote.get("total_alunos", 0)
+        item["status"] = origem  # "reaproveitado" | "recuperado_pdf" | "recuperado_ocr"
+        item["avisos"] = lote.get("avisos", [])
+        if origem == lote_mod.ORIGEM_OCR:
+            item["sem_match"] = [
+                {"numero": a["numero"], "lido": a.get("ocr_bruto", "")}
+                for a in lote.get("alunos", [])
+                if a.get("situacao") == "sem_match"
+            ]
+        resultados.append(item)
+
+    resultados.sort(key=lambda r: (r["restaurante"], r["periodo"]))
+    return jsonify({"resultados": resultados})
 
 
 @app.route("/preview/<int:idx>")
@@ -1077,8 +1158,9 @@ body {
     </div>
 
     <div class="tabs">
-        <button class="tab active" onclick="switchTab('template')">Gerar template</button>
-        <button class="tab" onclick="switchTab('processar')">Processar scan</button>
+        <button class="tab active" onclick="switchTab('template', this)">Gerar template</button>
+        <button class="tab" onclick="switchTab('processar', this)">Processar scan</button>
+        <button class="tab" onclick="switchTab('recuperar', this)">Recuperar lote</button>
     </div>
 
     <!-- ABA: GERAR TEMPLATE -->
@@ -1327,20 +1409,67 @@ body {
             </div>
         </div>
     </div>
+
+    <!-- ABA: RECUPERAR LOTE -->
+    <div class="panel" id="panel-recuperar">
+        <form id="form-recuperar" onsubmit="return submitRecuperar(event)">
+            <div class="section">
+                <div class="label">Restaurante <span style="font-weight:400;color:#aaa">(opcional — deixe em "Todos" pra varrer tudo)</span></div>
+                <div class="radio-group">
+                    <label class="radio selected" onclick="selectRadio(this, 'rest-recuperar')">
+                        <input type="radio" name="rest-recuperar" value="" checked> Todos
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-recuperar')">
+                        <input type="radio" name="rest-recuperar" value="canela"> Canela
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-recuperar')">
+                        <input type="radio" name="rest-recuperar" value="ondina"> Ondina
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-recuperar')">
+                        <input type="radio" name="rest-recuperar" value="sao_lazaro"> São Lázaro
+                    </label>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="label">Pasta com os scans preenchidos</div>
+                <input type="text" id="input-pasta-scans" placeholder="C:\\caminho\\para\\os\\scans"
+                       style="width:100%;max-width:480px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;box-sizing:border-box;">
+            </div>
+
+            <div class="section">
+                <div class="label">Pasta com os templates originais <span style="font-weight:400;color:#aaa">(opcional — sem ela, tenta reconstruir lendo o próprio scan)</span></div>
+                <input type="text" id="input-pasta-templates" placeholder="C:\\caminho\\para\\os\\templates"
+                       style="width:100%;max-width:480px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;box-sizing:border-box;">
+            </div>
+
+            <div style="font-size:12px;color:#999;margin-bottom:14px;">
+                O sistema lê o cabeçalho impresso em cada folha pra descobrir sozinho de qual
+                restaurante e período é cada scan — não importa o nome do arquivo. Com muitos
+                scans pode levar alguns minutos.
+            </div>
+
+            <button type="submit" class="btn" id="btn-recuperar">Buscar e recuperar</button>
+        </form>
+
+        <div class="loading" id="loading-recuperar">
+            <div class="spinner"></div>
+            Lendo as pastas e recuperando os lotes...
+        </div>
+
+        <div class="error-msg" id="error-recuperar"></div>
+
+        <div class="template-results" id="result-recuperar"></div>
+    </div>
 </div>
 
 <script>
-function switchTab(tab) {
+function switchTab(tab, btn) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
 
-    if (tab === 'template') {
-        document.querySelectorAll('.tab')[0].classList.add('active');
-        document.getElementById('panel-template').classList.add('active');
-    } else {
-        document.querySelectorAll('.tab')[1].classList.add('active');
-        document.getElementById('panel-processar').classList.add('active');
-    }
+    btn.classList.add('active');
+    document.getElementById('panel-' + tab).classList.add('active');
 }
 
 function selectRadio(el, name) {
@@ -1533,6 +1662,106 @@ function submitTemplate(e) {
         });
 
     return false;
+}
+
+function submitRecuperar(e) {
+    e.preventDefault();
+
+    var pastaScans = document.getElementById('input-pasta-scans').value.trim();
+    if (!pastaScans) {
+        showError('recuperar', 'Informe a pasta com os scans preenchidos.');
+        return false;
+    }
+    var pastaTemplates = document.getElementById('input-pasta-templates').value.trim();
+    var rest = document.querySelector('input[name="rest-recuperar"]:checked').value;
+
+    showLoading('recuperar', true);
+    hideError('recuperar');
+    document.getElementById('result-recuperar').innerHTML = '';
+
+    fetch('/recuperar_lotes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            pasta_scans: pastaScans,
+            pasta_templates: pastaTemplates,
+            restaurante: rest,
+        }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            showLoading('recuperar', false);
+            if (data.erro) {
+                showError('recuperar', data.erro);
+                return;
+            }
+            renderResultadosRecuperar(data.resultados || []);
+            // Os lotes recem-recuperados precisam aparecer em "Processar scan" sem F5.
+            carregarLotes();
+        })
+        .catch(function(err) {
+            showLoading('recuperar', false);
+            showError('recuperar', 'Erro de conexão: ' + err.message);
+        });
+
+    return false;
+}
+
+var _ROTULOS_RECUPERAR = {
+    recuperado_pdf: { texto: 'Recuperado do template', cor: '#1a7a3c' },
+    recuperado_ocr: { texto: 'Recuperado lendo o scan', cor: '#b57c10' },
+    reaproveitado:  { texto: 'Já existia',              cor: '#666'    },
+    incompleto:     { texto: 'Scan incompleto',         cor: '#dc2626' },
+    erro:           { texto: 'Erro',                    cor: '#dc2626' },
+};
+
+function renderResultadosRecuperar(resultados) {
+    var el = document.getElementById('result-recuperar');
+    if (!resultados.length) {
+        el.innerHTML = '<div style="color:#888;font-size:14px;padding:12px 0;">' +
+            'Nenhum scan reconhecido nessa pasta — confira se os PDFs são mesmo os scans preenchidos ' +
+            '(o sistema lê o cabeçalho impresso, não o nome do arquivo).</div>';
+        return;
+    }
+
+    var html = '';
+    resultados.forEach(function(r) {
+        var info = _ROTULOS_RECUPERAR[r.status] || { texto: r.status, cor: '#666' };
+        html += '<div class="template-item" style="flex-direction:column;align-items:stretch;">';
+        html += '  <div style="display:flex;justify-content:space-between;">';
+        html += '    <div><div>' + r.restaurante + ' — ' + r.periodo + '</div>';
+        if (r.total_alunos) {
+            html += '      <div class="template-info">' + r.total_alunos + ' pessoas' +
+                    (r.lote_id ? '  |  lote ' + r.lote_id : '') + '</div>';
+        }
+        html += '    </div>';
+        html += '    <span style="font-size:12px;font-weight:600;color:' + info.cor + ';white-space:nowrap;">' + info.texto + '</span>';
+        html += '  </div>';
+
+        if (r.detalhe) {
+            html += '  <div style="font-size:12px;color:' + info.cor + ';margin-top:4px;">' + r.detalhe + '</div>';
+        }
+        (r.avisos || []).forEach(function(a) {
+            html += '  <div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;' +
+                    'padding:9px 12px;font-size:12px;color:#7a5a10;margin-top:6px;">' + a + '</div>';
+        });
+        if (r.sem_match && r.sem_match.length) {
+            var linhas = r.sem_match.map(function(s) {
+                return 'linha ' + s.numero + ' (leu "' + s.lido + '")';
+            }).join(', ');
+            html += '  <div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;' +
+                    'padding:9px 12px;font-size:12px;color:#7a5a10;margin-top:6px;">' +
+                    r.sem_match.length + ' matrícula(s) não bateram com ninguém no cadastro — ' +
+                    'confira antes de processar: ' + linhas + '</div>';
+        }
+        html += '</div>';
+    });
+
+    html += '<div style="font-size:13px;color:#666;margin-top:10px;">Prontos? Vá na aba ' +
+            '<b>Processar scan</b>, escolha o restaurante — os lotes recuperados aparecem ' +
+            'sozinhos na lista.</div>';
+
+    el.innerHTML = html;
 }
 
 var lotesCarregados = [];

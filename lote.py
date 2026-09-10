@@ -37,6 +37,8 @@ import re
 import unicodedata
 from datetime import datetime, timedelta
 
+import lote_sync
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOTES_DIR = os.path.join(SCRIPT_DIR, "lotes")
 PROCESSADOS_DIR = os.path.join(LOTES_DIR, "processados")
@@ -212,22 +214,96 @@ def salvar_lote(lote: dict) -> str:
     caminho = os.path.join(LOTES_DIR, f"{lote['lote_id']}.json")
     with open(caminho, "w", encoding="utf-8") as f:
         json.dump(lote, f, ensure_ascii=False, indent=2)
+
+    _sincronizar(lote, caminho)
+
     return caminho
+
+
+def _sincronizar(lote: dict, caminho_json: str):
+    """
+    Envia o lote para a planilha compartilhada (Sheets), se configurado —
+    ver SINCRONIZACAO_LOTES.md. PDF não sincroniza por esse caminho (não
+    cabe bem numa célula); só roster/geometria, que é o que resolve o bug
+    de identidade entre máquinas.
+
+    Best-effort de propósito: uma máquina sem internet no momento continua
+    gerando e salvando localmente sem travar; a falha só fica registrada no
+    log. Enquanto não sincronizar, o lote só existe nesta máquina — mesma
+    situação de hoje.
+    """
+    try:
+        if not lote_sync.disponivel():
+            return
+        lote_sync.enviar(
+            lote["lote_id"],
+            caminho_json,
+            propriedades={
+                "restaurante_key": lote.get("restaurante_key", ""),
+                "restaurante_nome": lote.get("restaurante_nome", ""),
+                "datas": lote.get("datas", ""),
+                "mes_ano": lote.get("mes_ano", ""),
+                "dias": ",".join(lote.get("dias", [])),
+                "total_alunos": lote.get("total_alunos", 0),
+                "total_paginas": lote.get("total_paginas", 0),
+                "origem": lote.get("origem", ORIGEM_GERACAO),
+                "criado_em": lote.get("criado_em", ""),
+                "processado": "0",
+            },
+        )
+    except Exception as e:
+        print(f"  AVISO: não foi possível sincronizar o lote "
+              f"'{lote['lote_id']}': {e}")
 
 
 def caminho_pdf(lote_id: str) -> str:
     return os.path.join(LOTES_DIR, f"{lote_id}.pdf")
 
 
+def garantir_pdf_local(lote_id: str):
+    """
+    Devolve o caminho do PDF se ele existir localmente. PDF não sincroniza
+    entre máquinas (ver `_sincronizar`) — só existe na máquina onde o lote
+    foi gerado; reimprimir de outra máquina não é possível hoje.
+
+    Returns:
+        O caminho local se o PDF existir, ou None caso contrário.
+    """
+    caminho = caminho_pdf(lote_id)
+    return caminho if os.path.isfile(caminho) else None
+
+
 def carregar_lote(lote_id: str) -> dict:
-    """Procura primeiro entre os ativos, depois no histórico de processados."""
+    """
+    Procura primeiro entre os ativos, depois no histórico de processados e,
+    por fim, na planilha compartilhada (Sheets) — o caso do lote gerado em
+    outra máquina (ver SINCRONIZACAO_LOTES.md). Quando vem de lá, grava uma
+    cópia local em LOTES_DIR antes de devolver, para que o resto do ciclo de
+    vida (registrar_processamento etc.) funcione como se o lote sempre
+    tivesse existido aqui.
+    """
     for pasta in (LOTES_DIR, PROCESSADOS_DIR):
         caminho = os.path.join(pasta, f"{lote_id}.json")
         if os.path.isfile(caminho):
             with open(caminho, "r", encoding="utf-8") as f:
                 return json.load(f)
+
+    remoto = None
+    try:
+        if lote_sync.disponivel():
+            remoto = lote_sync.baixar_json(lote_id)
+    except Exception as e:
+        print(f"  AVISO: falha ao buscar o lote '{lote_id}' na planilha compartilhada: {e}")
+
+    if remoto is not None:
+        os.makedirs(LOTES_DIR, exist_ok=True)
+        with open(os.path.join(LOTES_DIR, f"{lote_id}.json"), "w", encoding="utf-8") as f:
+            json.dump(remoto, f, ensure_ascii=False, indent=2)
+        return remoto
+
     raise FileNotFoundError(
-        f"Lote '{lote_id}' não encontrado em {LOTES_DIR} nem em {PROCESSADOS_DIR}."
+        f"Lote '{lote_id}' não encontrado em {LOTES_DIR}, {PROCESSADOS_DIR} "
+        "nem na planilha compartilhada."
     )
 
 
@@ -239,6 +315,7 @@ def listar_lotes(restaurante_key=None, incluir_processados=True, limite=None) ->
         Lista de dicts resumidos (sem o roster completo), com "processado".
     """
     itens = []
+    vistos = set()
     pastas = [(LOTES_DIR, False)]
     if incluir_processados:
         pastas.append((PROCESSADOS_DIR, True))
@@ -252,8 +329,10 @@ def listar_lotes(restaurante_key=None, incluir_processados=True, limite=None) ->
                 continue
             if restaurante_key and lote.get("restaurante_key") != restaurante_key:
                 continue
+            lote_id = lote.get("lote_id", "")
+            vistos.add(lote_id)
             itens.append({
-                "lote_id": lote.get("lote_id", ""),
+                "lote_id": lote_id,
                 "restaurante_key": lote.get("restaurante_key", ""),
                 "restaurante_nome": lote.get("restaurante_nome", ""),
                 "criado_em": lote.get("criado_em", ""),
@@ -267,8 +346,24 @@ def listar_lotes(restaurante_key=None, incluir_processados=True, limite=None) ->
                 "notas": lote.get("notas", []),
                 "processado": processado,
                 "processamentos": lote.get("processamentos", []),
-                "tem_pdf": os.path.isfile(caminho_pdf(lote.get("lote_id", ""))),
+                "tem_pdf": os.path.isfile(caminho_pdf(lote_id)),
+                "local": True,
             })
+
+    # Lotes que só existem na planilha compartilhada — gerados em outra
+    # máquina, ainda não baixados nesta (ver SINCRONIZACAO_LOTES.md). O
+    # local, quando existe, é sempre a versão que vale: só ele sabe se já
+    # foi processado *nesta* máquina antes de isso voltar pra planilha.
+    try:
+        if lote_sync.disponivel():
+            for remoto in lote_sync.listar(restaurante_key):
+                if remoto["lote_id"] in vistos:
+                    continue
+                if not incluir_processados and remoto.get("processado"):
+                    continue
+                itens.append(remoto)
+    except Exception as e:
+        print(f"  AVISO: falha ao listar lotes da planilha compartilhada: {e}")
 
     itens.sort(key=lambda x: x["criado_em"], reverse=True)
     return itens[:limite] if limite else itens
@@ -434,11 +529,24 @@ def registrar_processamento(lote_id, periodo, sincronizado_sheets,
                 os.remove(origem)
             except OSError:
                 pass
-        return destino_hist
+        resultado = destino_hist
+    else:
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump(lote, f, ensure_ascii=False, indent=2)
+        resultado = caminho
 
-    with open(caminho, "w", encoding="utf-8") as f:
-        json.dump(lote, f, ensure_ascii=False, indent=2)
-    return caminho
+    # Marca o lote como processado na planilha compartilhada também — sem
+    # isso, outras máquinas continuariam oferecendo-o como pendente na
+    # próxima listagem (ver SINCRONIZACAO_LOTES.md). Best-effort de
+    # propósito, mesmo motivo de `_sincronizar`.
+    try:
+        if lote_sync.disponivel():
+            lote_sync.marcar_processado(lote_id, bool(sincronizado_sheets))
+    except Exception as e:
+        print(f"  AVISO: falha ao marcar o lote '{lote_id}' como "
+              f"processado na planilha compartilhada: {e}")
+
+    return resultado
 
 
 def limpar_antigos(dias_retencao=180, aplicar=False) -> list:

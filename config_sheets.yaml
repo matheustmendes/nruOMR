@@ -31,6 +31,22 @@ restaurantes:
 
 dashboard_spreadsheet_id: "1d4SfVWnG8iwk90jGnPIj7U6bPG5nriA5F2b-6pvSt60"
 
+# Sincronização de lotes entre máquinas (ver SINCRONIZACAO_LOTES.md)
+#
+# O lote (roster + geometria congelados no momento da impressão) nasce só na
+# máquina que gerou o template. Sem isso, a máquina que processa o scan não
+# o enxerga. Reaproveita a planilha do dashboard acima (já compartilhada
+# como Editor) numa aba nova ("lotes_sync") — nenhuma configuração extra é
+# necessária. PDF não sincroniza (só o roster/geometria, que é o que
+# resolve o bug de identidade); reimprimir continua só na máquina que gerou.
+#
+# Use os campos abaixo só se quiser uma planilha separada da do dashboard
+# (ex.: por controle de acesso). Nesse caso, compartilhe-a também com o
+# "client_email" de credentials_sheets.json, permissão de Editor.
+lotes_sincronizacao:
+  spreadsheet_id: ""   # vazio = reaproveita dashboard_spreadsheet_id
+  aba: "lotes_sync"
+
 # Módulo de justificativas — respostas do Google Forms
 # Deixe spreadsheet_id vazio para desativar o módulo.
 #

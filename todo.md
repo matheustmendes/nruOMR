@@ -4,18 +4,40 @@
 
 ---
 
-## ▶ PRÓXIMA SESSÃO — sincronização de lotes entre máquinas + UX
+## ▶ PRÓXIMA SESSÃO — UX do fluxo de lote
 
-Ver **`SINCRONIZACAO_LOTES.md`** — documento novo, escrito para retomar
-daqui. Problema: lista é gerada numa máquina, o lote (`lotes/<id>.json`)
-nasce só ali (é disco local, de propósito fora do git), e o processamento
-roda noutra máquina que não tem esse lote — cai no modo legado ou precisa de
-`recuperar_lote.py` via OCR. O documento mapeia 5 opções de sincronização
-(pasta sincronizada, Sheets, Drive API, banco hospedado, servidor próprio) e
-um quick-win sem infraestrutura nova (baixar/importar o `.json` junto do
-PDF), mais o problema separado de deixar o fluxo do lote compreensível para
-quem não é técnico. Nada foi decidido nem implementado — são perguntas em
-aberto para o usuário, documentadas lá.
+Sincronização de lotes entre máquinas **implementada e ativa** (2026-09-10)
+via Google Sheets — ver **`SINCRONIZACAO_LOTES.md`** para o design completo
+e o porquê (a primeira tentativa foi Drive API e esbarrou num limite real
+de cota de conta de serviço fora de Workspace; Sheets reaproveita a
+planilha do dashboard que já funciona, sem configuração nova). Testado de
+ponta a ponta contra a planilha real. Limitação aceita: PDF não sincroniza,
+só o roster/geometria (o que resolve o bug de identidade) — reimpressão
+exata continua só na máquina que gerou o lote.
+
+**Lotes grandes (Canela, 500+ pessoas) — resolvido de vez.** O JSON do
+lote passa dos 50.000 caracteres por célula que o Sheets aceita. Corrigido
+fatiando automaticamente em colunas extras (`lote_sync._particionar` +
+`_garantir_colunas`, que redimensiona a aba sozinha quando precisa) — a
+leitura junta os pedaços de volta. Testado de ponta a ponta com um lote
+real de 539 pessoas (83KB de JSON, 2 colunas): sobe, baixa, os dados batem
+exatamente. Teto de segurança em 14 colunas de JSON (~630KB) antes de
+desistir e avisar que ficou só local — bem acima de qualquer lote real
+visto até aqui.
+
+**Recuperação de lote acessível na UI** (2026-09-10) — nova aba "Recuperar
+lote" em `web.py`: aponta pra uma pasta de scans (+ opcionalmente uma pasta
+de templates), casa cada scan com seu template pelo período automaticamente
+(reaproveita o casamento já testado de `corrigir_passivo.py`), recupera o
+lote (exato via template, ou por OCR do scan quando não achar o template) e
+lista o resultado em português simples — sem exigir linha de comando.
+Rodar duas vezes não duplica (reaproveita o lote já criado pro mesmo
+período). Não escreve no Sheets — só cria o lote; a presença é lançada
+depois, normalmente, pela aba "Processar scan" já existente.
+
+Próximo passo, ainda não atacado: deixar o resto do fluxo do lote
+compreensível para quem não é técnico (`SINCRONIZACAO_LOTES.md` tem uma
+seção mapeando o que já é amigável e o que não é).
 
 ### Estado do passivo (correção de listas trocadas)
 

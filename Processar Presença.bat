@@ -10,6 +10,9 @@ echo   O navegador abrirá automaticamente.
 echo   NÃO feche esta janela enquanto estiver usando.
 echo.
 
+call "%~dp0atualizar.bat"
+echo.
+
 if exist "venv\Scripts\python.exe" (
     venv\Scripts\python.exe web.py
 ) else (

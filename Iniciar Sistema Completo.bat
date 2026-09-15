@@ -13,6 +13,9 @@ echo   Aguarde um instante. Duas abas vao abrir
 echo   automaticamente no seu navegador.
 echo.
 
+call "%~dp0atualizar.bat"
+echo.
+
 if exist "venv\Scripts\python.exe" (
     set "PYTHON=venv\Scripts\python.exe"
 ) else (

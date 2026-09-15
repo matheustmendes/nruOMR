@@ -307,6 +307,17 @@ def carregar_lote(lote_id: str) -> dict:
     )
 
 
+def status_sincronizacao() -> dict:
+    """Diagnóstico da sincronização entre máquinas, pra expor na UI (rota
+    `/lotes`) — ver SINCRONIZACAO_LOTES.md. Mesmo padrão best-effort do
+    resto deste módulo: uma falha aqui nunca derruba a listagem de lotes,
+    só faz a UI mostrar "não sei dizer" em vez do motivo real."""
+    try:
+        return lote_sync.status()
+    except Exception as e:
+        return {"ok": False, "motivo": f"Falha ao checar sincronização: {e}"}
+
+
 def listar_lotes(restaurante_key=None, incluir_processados=True, limite=None) -> list:
     """
     Lista os lotes conhecidos, mais recentes primeiro.

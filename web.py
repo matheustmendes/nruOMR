@@ -633,7 +633,7 @@ def rota_lotes():
     restaurante_key = request.args.get("restaurante") or None
     limite = request.args.get("limite", default=60, type=int)
     itens = lote_mod.listar_lotes(restaurante_key, limite=limite)
-    return jsonify({"lotes": itens})
+    return jsonify({"lotes": itens, "sincronizacao": lote_mod.status_sincronizacao()})
 
 
 @app.route("/lote/<lote_id>/pdf")
@@ -1356,6 +1356,7 @@ body {
                     <span style="color:#999;font-weight:600;">✓</span> já processado nesta semana &nbsp;
                     <span style="color:#ccc;font-weight:600;">—</span> não existe lote
                 </div>
+                <div id="sync-status-banner" style="display:none;background:#fef3c7;border:1px solid #f59e0b;color:#92400e;font-size:12.5px;padding:8px 10px;border-radius:6px;margin-bottom:8px;"></div>
                 <div id="grade-lotes-wrap">
                     <div style="color:#888;font-size:13px;padding:10px 0;">Carregando lotes...</div>
                 </div>
@@ -2153,10 +2154,25 @@ function carregarLotes() {
         .then(data => {
             lotesCarregados = dedupPorLoteId(data.lotes || []);
             renderGradeLotes();
+            exibirStatusSincronizacao(data.sincronizacao);
         })
         .catch(function() {
             wrap.innerHTML = '<div style="color:#dc2626;font-size:13px;">Erro ao listar lotes.</div>';
         });
+}
+
+// Mostra por que a sincronização entre máquinas está desligada — sem isso,
+// um lote gerado noutra máquina "some" sem nenhuma pista na tela (ver
+// SINCRONIZACAO_LOTES.md). Some sozinho quando a sincronização está ok.
+function exibirStatusSincronizacao(sincronizacao) {
+    var banner = document.getElementById('sync-status-banner');
+    if (!banner) return;
+    if (sincronizacao && sincronizacao.ok === false && sincronizacao.motivo) {
+        banner.textContent = '⚠ Sincronização de lotes entre máquinas desativada: ' + sincronizacao.motivo;
+        banner.style.display = 'block';
+    } else {
+        banner.style.display = 'none';
+    }
 }
 
 function renderGradeLotes() {

@@ -39,6 +39,7 @@ sem duplicar o padrão de autenticação/retry num módulo à parte.
 """
 
 import json
+import os
 
 import google_sheets as gs
 
@@ -82,6 +83,49 @@ def disponivel() -> bool:
     except FileNotFoundError:
         return False
     return bool(_spreadsheet_id(config))
+
+
+def status() -> dict:
+    """Diagnóstico pra exibir na UI (ver ATUALIZACAO_SINCRONIZACAO_LOTES.md).
+
+    `disponivel()` só diz se a sincronização está *configurada*; não checa
+    se as credenciais realmente existem no disco *desta* máquina, que é o
+    jeito mais comum de isso quebrar silenciosamente (arquivo é gitignorado
+    de propósito, então nunca chega por `git pull` — tem que ser copiado à
+    mão). Não faz chamada de rede, só checagens locais; erros de
+    autenticação/permissão que só aparecem na hora de falar com a API
+    continuam reportados pelos "AVISO" de `lote.py`.
+    """
+    if not gs._DISPONIVEL:
+        return {
+            "ok": False,
+            "motivo": "Bibliotecas 'gspread'/'google-auth' não instaladas nesta máquina.",
+        }
+    try:
+        config = _config()
+    except FileNotFoundError as e:
+        return {"ok": False, "motivo": str(e)}
+
+    if not _spreadsheet_id(config):
+        return {
+            "ok": False,
+            "motivo": "Sincronização de lotes não configurada (spreadsheet_id vazio em config_sheets.yaml).",
+        }
+
+    creds_path = config.get("credentials", "credentials_sheets.json")
+    if not os.path.isabs(creds_path):
+        creds_path = os.path.join(gs.SCRIPT_DIR, creds_path)
+    if not os.path.exists(creds_path):
+        return {
+            "ok": False,
+            "motivo": (
+                f"Credenciais não encontradas nesta máquina: {creds_path} — "
+                "copie o arquivo credentials_sheets.json de uma máquina que já "
+                "sincroniza (não vem pelo git, é gitignorado de propósito)."
+            ),
+        }
+
+    return {"ok": True, "motivo": None}
 
 
 def _obter_aba(config):

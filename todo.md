@@ -76,7 +76,7 @@ estiverem reconciliados, nunca no meio (desloca as linhas de baixo).
 
 ## Pendências operacionais
 
-- [ ] **URGENTE — mesma matrícula em pessoas diferentes (Ondina).** Três casos em que duas pessoas distintas compartilham matrícula. Como o Sheets casa por matrícula e a primeira linha vence, uma delas fica sem frequência **toda semana** — problema independente da lista trocada, e continua acontecendo até a planilha de origem ser corrigida:
+- [ ] **URGENTE — mesma matrícula em pessoas diferentes (Ondina).** Três casos em que duas pessoas distintas compartilham matrícula. Como o Sheets casa por matrícula e a primeira linha vence, uma delas fica sem frequência **toda semana** — problema independente da lista trocada, e continua acontecendo até a planilha de origem ser corrigida. **Mitigado em 2026-09-15:** `exportar_para_sheets` agora roda `_detectar_matriculas_duplicadas` a cada exportação e devolve `aviso_matricula_duplicada`, mostrado na tela (caixa de avisos) toda vez que acontece — não evita a perda daquela semana, só garante que fica visível em vez de passar batido:
   - `221118905` — Geovana Luiza da Silva / Geovana Luiza da Silva Batista
   - `225115016` — Alidey Godwill Uranof Kpoahoun / Kpoahoun Alidey Godwill Uranof (mesmo nome invertido — confirmar se são duas pessoas ou cadastro em duplicidade)
   - `225115165` — Ludimila Bauin Oliveira Sanca / Ludimila Buin Oliveira Sanca
@@ -85,7 +85,6 @@ estiverem reconciliados, nunca no meio (desloca as linhas de baixo).
 
 ## Melhorias
 
-- [ ] **Estrutura da planilha de exportação no Sheets** — períodos atualmente empilhados verticalmente (um abaixo do outro); devem ficar lado a lado (colunas horizontais por período).
 - [ ] **Trocar geração de xlsx temporário pela planilha existente no projeto** — exportação cria xlsx novo a cada processamento; substituir pelo arquivo já existente.
 - [x] **Executável para iniciar o projeto inteiro** — sobe `web.py` (5000) e `dashboard.py` (5001) juntos. (`Iniciar Sistema Completo.bat`)
 - [x] **Snapshot de lote de impressão** — PDF e roster nascem juntos em `lotes/`, com a geometria congelada. Código do lote impresso no rodapé da folha. Ver LOTES.md.

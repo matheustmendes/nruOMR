@@ -155,6 +155,37 @@ def _norm_nome(valor):
     return " ".join(str(valor or "").split()).lower()
 
 
+def _detectar_matriculas_duplicadas(alunos):
+    """
+    Acha matrículas que aparecem em `alunos` associadas a nomes diferentes.
+
+    `_sincronizar_roster` casa por matrícula e a primeira linha vence — uma
+    matrícula assim nunca ganha uma segunda linha própria, então a colisão
+    não aparece mais tarde na aba (`diagnosticar_aba` não a pega). Por isso
+    o aviso tem que nascer aqui, a cada exportação, direto da lista de
+    alunos daquela semana.
+
+    Returns:
+        [{"matricula", "nomes": [nome1, nome2]}] — só os casos de
+        matrícula igual com nome diferente (duplicata de mesma pessoa na
+        planilha de origem não entra: não perde frequência).
+    """
+    vistos, duplicadas = {}, []
+    for nome, mat in alunos:
+        chave = _norm_mat(mat)
+        if not chave:
+            continue
+        nome_norm = _norm_nome(nome)
+        if chave not in vistos:
+            vistos[chave] = (nome, nome_norm)
+        elif vistos[chave][1] != nome_norm:
+            duplicadas.append({
+                "matricula": chave,
+                "nomes": [vistos[chave][0], nome],
+            })
+    return duplicadas
+
+
 def _garantir_grade(aba, linhas, colunas):
     """Expande a grade da aba se o layout exigir mais linhas/colunas."""
     if aba.row_count < linhas:
@@ -827,6 +858,10 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo,
             {"ok": True, "aba": "Maio 2026"}                          — sucesso
             {"ok": True, "aba": "...", "aviso_formatacao": "..."}     — dados salvos, formatação falhou
             {"ok": True, "aba": "...", "aviso_ordem": "..."}          — dados salvos, ordenação desligada
+            {"ok": True, "aba": "...", "aviso_matricula_duplicada": "..."}
+                — dados salvos, mas `alunos` tem a mesma matrícula em nomes
+                  diferentes: uma das duas pessoas não recebeu linha própria
+                  nesta exportação (ver `_sincronizar_roster`)
             {"ok": False, "duplicado": True, "aba": "..."}            — período já existe
             {"ok": False, "erro": "mensagem"}                         — erro
     """
@@ -949,6 +984,16 @@ def exportar_para_sheets(contagem, alunos, dias, restaurante_key, periodo,
         resposta = {"ok": True, "aba": nome_aba}
         if aviso_ordem:
             resposta["aviso_ordem"] = aviso_ordem
+
+        duplicadas = _detectar_matriculas_duplicadas(alunos)
+        if duplicadas:
+            resposta["aviso_matricula_duplicada"] = (
+                "Matrícula em pessoas diferentes — uma delas fica sem "
+                "frequência nesta semana: " + "; ".join(
+                    f"{d['matricula']} ({d['nomes'][0]} / {d['nomes'][1]})"
+                    for d in duplicadas
+                )
+            )
 
         try:
             _formatar_colunas_fixas(spreadsheet, aba, linha_fim)

@@ -301,6 +301,40 @@ class TestCicloDeVida:
         )
         assert lote_mod.limpar_antigos(dias_retencao=0, aplicar=True) == []
 
+    def test_detalhar_candidatos_traz_o_suficiente_pra_conferencia(self):
+        lote_mod.salvar_lote(_lote(PESSOAS))
+        lote_mod.registrar_processamento(
+            "teste_20260101-000000", "05/05 a 09/05", sincronizado_sheets=True
+        )
+
+        candidatos = lote_mod.detalhar_candidatos_limpeza(dias_retencao=0)
+        assert candidatos == [{
+            "lote_id": "teste_20260101-000000",
+            "restaurante": "Canela",
+            "periodo": "05/05 a 09/05",
+            "datas": "05/05 a 09/05",
+            "total_alunos": 4,
+            "ultimo_processamento": candidatos[0]["ultimo_processamento"],
+        }]
+
+    def test_detalhar_candidatos_nao_apaga_nada(self):
+        lote_mod.salvar_lote(_lote(PESSOAS))
+        lote_mod.registrar_processamento(
+            "teste_20260101-000000", "x", sincronizado_sheets=True
+        )
+
+        lote_mod.detalhar_candidatos_limpeza(dias_retencao=0)
+        assert os.path.exists(
+            os.path.join(lote_mod.PROCESSADOS_DIR, "teste_20260101-000000.json")
+        )
+
+    def test_detalhar_candidatos_respeita_retencao(self):
+        lote_mod.salvar_lote(_lote(PESSOAS))
+        lote_mod.registrar_processamento(
+            "teste_20260101-000000", "x", sincronizado_sheets=True
+        )
+        assert lote_mod.detalhar_candidatos_limpeza(dias_retencao=180) == []
+
 
 # ---------------------------------------------------------------------------
 # Sincronização entre máquinas (lote_sync é sempre mockado — nenhum destes

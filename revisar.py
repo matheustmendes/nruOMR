@@ -143,9 +143,10 @@ def _exportar_js(submit_url):
             var caixa = document.getElementById('export-msg');
             if (data.sheets_ok) {{
                 caixa.textContent = 'Correções salvas e enviadas ao Google Sheets'
-                    + (data.sheets_aba ? ' (' + data.sheets_aba + ').' : '.');
-                caixa.style.background = '#eef7ee';
-                caixa.style.color = '#2a6b2a';
+                    + (data.sheets_aba ? ' (' + data.sheets_aba + ').' : '.')
+                    + (data.sheets_aviso_matricula ? ' ' + data.sheets_aviso_matricula : '');
+                caixa.style.background = data.sheets_aviso_matricula ? '#fff8e6' : '#eef7ee';
+                caixa.style.color = data.sheets_aviso_matricula ? '#7a5a10' : '#2a6b2a';
             }} else {{
                 caixa.textContent = 'Correções salvas na planilha local, mas NÃO foram '
                     + 'para o Google Sheets: ' + (data.sheets_erro || 'falha desconhecida')

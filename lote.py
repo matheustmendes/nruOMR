@@ -549,20 +549,16 @@ def registrar_processamento(lote_id, periodo, sincronizado_sheets,
     return resultado
 
 
-def limpar_antigos(dias_retencao=180, aplicar=False) -> list:
+def _candidatos_limpeza(dias_retencao):
     """
-    Rotina de limpeza definitiva — separada e deliberada, nunca automática no
-    momento do processamento.
-
-    Args:
-        dias_retencao: idade mínima (pela data de processamento) para apagar.
-        aplicar: se False (padrão), apenas lista o que seria apagado.
+    Lotes arquivados, já sincronizados com o Sheets, cujo último
+    processamento é mais antigo que `dias_retencao`.
 
     Returns:
-        Lista de lote_ids candidatos/apagados.
+        [(caminho_json, lote_dict, data_ultimo_processamento), ...]
     """
     limite = datetime.now() - timedelta(days=dias_retencao)
-    alvos = []
+    candidatos = []
 
     for caminho in glob.glob(os.path.join(PROCESSADOS_DIR, "*.json")):
         try:
@@ -581,13 +577,59 @@ def limpar_antigos(dias_retencao=180, aplicar=False) -> list:
             continue
 
         if ultimo < limite:
-            alvos.append(lote["lote_id"])
-            if aplicar:
-                for p in (caminho, caminho_pdf(lote["lote_id"])):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+            candidatos.append((caminho, lote, ultimo))
+
+    return candidatos
+
+
+def detalhar_candidatos_limpeza(dias_retencao=180) -> list:
+    """
+    Como `limpar_antigos`, mas devolve o suficiente pra mostrar uma lista de
+    conferência antes de apagar (usado pela limpeza manual na UI).
+
+    Returns:
+        [{"lote_id", "restaurante", "periodo", "datas", "total_alunos",
+          "ultimo_processamento"}], mais recente primeiro.
+    """
+    itens = [
+        {
+            "lote_id": lote["lote_id"],
+            "restaurante": lote.get("restaurante_nome", lote.get("restaurante_key", "")),
+            "periodo": max(
+                (p.get("periodo", "") for p in lote.get("processamentos", [])),
+                default="",
+            ),
+            "datas": lote.get("datas", ""),
+            "total_alunos": lote.get("total_alunos", 0),
+            "ultimo_processamento": ultimo.isoformat(timespec="seconds"),
+        }
+        for _, lote, ultimo in _candidatos_limpeza(dias_retencao)
+    ]
+    itens.sort(key=lambda i: i["ultimo_processamento"], reverse=True)
+    return itens
+
+
+def limpar_antigos(dias_retencao=180, aplicar=False) -> list:
+    """
+    Rotina de limpeza definitiva — separada e deliberada, nunca automática no
+    momento do processamento.
+
+    Args:
+        dias_retencao: idade mínima (pela data de processamento) para apagar.
+        aplicar: se False (padrão), apenas lista o que seria apagado.
+
+    Returns:
+        Lista de lote_ids candidatos/apagados.
+    """
+    alvos = []
+    for caminho, lote, _ in _candidatos_limpeza(dias_retencao):
+        alvos.append(lote["lote_id"])
+        if aplicar:
+            for p in (caminho, caminho_pdf(lote["lote_id"])):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     return alvos
 

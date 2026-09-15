@@ -135,3 +135,31 @@ class TestLerGrupos:
 
     def test_grade_vazia_nao_quebra(self):
         assert gs._ler_grupos([]) == []
+
+
+class TestDetectarMatriculasDuplicadas:
+
+    def test_mesma_matricula_nomes_diferentes_e_reportada(self):
+        alunos = [("Fulana Silva", "111"), ("Fulana Silva Batista", "111")]
+
+        achadas = gs._detectar_matriculas_duplicadas(alunos)
+
+        assert achadas == [{
+            "matricula": "111",
+            "nomes": ["Fulana Silva", "Fulana Silva Batista"],
+        }]
+
+    def test_mesma_matricula_mesmo_nome_nao_e_reportada(self):
+        alunos = [("Fulana Silva", "111"), ("fulana  silva", "111")]
+
+        assert gs._detectar_matriculas_duplicadas(alunos) == []
+
+    def test_matricula_vazia_e_ignorada(self):
+        alunos = [("Fulana Silva", ""), ("Ciclana Souza", "")]
+
+        assert gs._detectar_matriculas_duplicadas(alunos) == []
+
+    def test_sem_duplicata_nao_reporta_nada(self):
+        alunos = [("Fulana Silva", "111"), ("Ciclana Souza", "222")]
+
+        assert gs._detectar_matriculas_duplicadas(alunos) == []

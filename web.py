@@ -15,6 +15,7 @@ import json
 import threading
 import webbrowser
 import tempfile
+import shutil
 import traceback
 from io import BytesIO
 
@@ -320,9 +321,15 @@ def rota_processar():
 
         if resultado_sheets.get("ok"):
             sheets_resp = {"sheets_status": "ok", "sheets_aba": resultado_sheets.get("aba", "")}
-            aviso = resultado_sheets.get("aviso_ordem") or resultado_sheets.get("aviso_formatacao")
+            aviso = (
+                resultado_sheets.get("aviso_ordem")
+                or resultado_sheets.get("aviso_formatacao")
+            )
             if aviso:
                 sheets_resp["sheets_aviso"] = aviso
+            aviso_mat = resultado_sheets.get("aviso_matricula_duplicada")
+            if aviso_mat:
+                sheets_resp["sheets_aviso_matricula"] = aviso_mat
         elif resultado_sheets.get("duplicado"):
             sheets_resp = {"sheets_status": "duplicado", "sheets_aba": resultado_sheets.get("aba", "")}
         else:
@@ -568,6 +575,7 @@ def rota_aplicar_correcoes():
             "sheets_ok": bool(sheets_resp.get("ok")),
             "sheets_erro": sheets_resp.get("erro", ""),
             "sheets_aba": sheets_resp.get("aba", ""),
+            "sheets_aviso_matricula": sheets_resp.get("aviso_matricula_duplicada", ""),
         })
     except Exception as e:
         traceback.print_exc()
@@ -597,7 +605,11 @@ def rota_sheets_exportar():
             )
 
         if resultado.get("ok"):
-            return jsonify({"sucesso": True, "aba": resultado.get("aba", "")})
+            return jsonify({
+                "sucesso": True,
+                "aba": resultado.get("aba", ""),
+                "sheets_aviso_matricula": resultado.get("aviso_matricula_duplicada", ""),
+            })
         else:
             return jsonify({"erro": resultado.get("erro", "Erro desconhecido")}), 500
 
@@ -619,7 +631,8 @@ def rota_download():
 def rota_lotes():
     """Lotes disponíveis para processar, mais recentes primeiro."""
     restaurante_key = request.args.get("restaurante") or None
-    itens = lote_mod.listar_lotes(restaurante_key, limite=60)
+    limite = request.args.get("limite", default=60, type=int)
+    itens = lote_mod.listar_lotes(restaurante_key, limite=limite)
     return jsonify({"lotes": itens})
 
 
@@ -647,24 +660,48 @@ def rota_recuperar_lotes():
     quando não há template. Não grava nada no Sheets: só cria o lote, que
     depois é processado normalmente pela aba "Processar scan".
     """
-    dados = request.get_json(silent=True) or request.form
-    pasta_scans = (dados.get("pasta_scans") or "").strip()
-    pasta_templates = (dados.get("pasta_templates") or "").strip()
-    restaurante_filtro = (dados.get("restaurante") or "").strip() or None
+    restaurante_filtro = (request.form.get("restaurante") or "").strip() or None
+    scan_files = request.files.getlist("scans")
+    template_files = request.files.getlist("templates")
 
-    if not pasta_scans or not os.path.isdir(pasta_scans):
-        return jsonify({"erro": "Pasta de scans não encontrada."}), 400
-    if pasta_templates and not os.path.isdir(pasta_templates):
-        return jsonify({"erro": "Pasta de templates não encontrada."}), 400
+    if not scan_files:
+        return jsonify({"erro": "Selecione os PDFs escaneados."}), 400
 
+    # `_agrupar_scans`/`_indexar_pdfs` só precisam de um diretório com os
+    # PDFs dentro (o glob é recursivo) — não do caminho original de quem
+    # enviou. Salva os uploads num diretório temporário e apaga tudo no
+    # fim, sucesso ou erro.
+    pasta_scans = tempfile.mkdtemp(prefix="recuperar_scans_")
+    pasta_templates = tempfile.mkdtemp(prefix="recuperar_templates_") if template_files else None
     try:
-        grupos = corrigir_passivo._agrupar_scans(pasta_scans)
-        templates = (corrigir_passivo._indexar_pdfs(pasta_templates, exigir_formulario=True)
-                     if pasta_templates else [])
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"erro": f"Falha ao ler as pastas: {e}"}), 500
+        for i, f in enumerate(scan_files):
+            f.save(os.path.join(pasta_scans, f"scan_{i}.pdf"))
+        for i, f in enumerate(template_files):
+            f.save(os.path.join(pasta_templates, f"template_{i}.pdf"))
 
+        try:
+            grupos = corrigir_passivo._agrupar_scans(pasta_scans)
+            templates = (corrigir_passivo._indexar_pdfs(pasta_templates, exigir_formulario=True)
+                         if pasta_templates else [])
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"erro": f"Falha ao ler os PDFs enviados: {e}"}), 500
+
+        resultados = _casar_scans_com_templates(grupos, templates, restaurante_filtro)
+    finally:
+        shutil.rmtree(pasta_scans, ignore_errors=True)
+        if pasta_templates:
+            shutil.rmtree(pasta_templates, ignore_errors=True)
+
+    resultados.sort(key=lambda r: (r["restaurante"], r["periodo"]))
+    return jsonify({"resultados": resultados})
+
+
+def _casar_scans_com_templates(grupos, templates, restaurante_filtro):
+    """Corpo original de `rota_recuperar_lotes` — casa cada grupo de scan
+    com seu template (ou recupera por OCR), extraído pra função separada
+    só pra poder rodar dentro do `finally` que limpa os diretórios
+    temporários sem aninhar mais um nível de indentação."""
     resultados = []
     for (restaurante_key, periodo), grupo in grupos.items():
         if restaurante_filtro and restaurante_key != restaurante_filtro:
@@ -714,8 +751,45 @@ def rota_recuperar_lotes():
             ]
         resultados.append(item)
 
-    resultados.sort(key=lambda r: (r["restaurante"], r["periodo"]))
-    return jsonify({"resultados": resultados})
+    return resultados
+
+
+@app.route("/lotes_limpar_preview", methods=["POST"])
+def rota_lotes_limpar_preview():
+    """
+    Só lista o que a limpeza apagaria — nunca apaga nada. É o passo de
+    conferência obrigatório antes de `/lotes_limpar_aplicar`.
+    """
+    dados = request.get_json(silent=True) or {}
+    try:
+        dias = int(dados.get("dias", 180))
+    except (TypeError, ValueError):
+        return jsonify({"erro": "Dias de retenção inválido."}), 400
+    if dias < 0:
+        return jsonify({"erro": "Dias de retenção não pode ser negativo."}), 400
+
+    candidatos = lote_mod.detalhar_candidatos_limpeza(dias)
+    return jsonify({"candidatos": candidatos, "dias": dias})
+
+
+@app.route("/lotes_limpar_aplicar", methods=["POST"])
+def rota_lotes_limpar_aplicar():
+    """
+    Apaga de fato — só arquivos locais de lotes já arquivados e sincronizados
+    com o Sheets (`limpar_antigos` garante isso). A barreira de "tem certeza"
+    é responsabilidade da UI (preview + confirmação); aqui só exigimos que o
+    cliente tenha passado por ela.
+    """
+    dados = request.get_json(silent=True) or {}
+    try:
+        dias = int(dados.get("dias", 180))
+    except (TypeError, ValueError):
+        return jsonify({"erro": "Dias de retenção inválido."}), 400
+    if not dados.get("confirmar"):
+        return jsonify({"erro": "Confirmação ausente."}), 400
+
+    apagados = lote_mod.limpar_antigos(dias, aplicar=True)
+    return jsonify({"apagados": apagados})
 
 
 @app.route("/preview/<int:idx>")
@@ -1064,6 +1138,26 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.grade-lote-cel {
+    cursor: pointer;
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 6px;
+    transition: background 0.1s;
+}
+.grade-lote-cel:hover { background: #f0f0ee; }
+.grade-lote-cel-selecionada { background: #eff6ff; outline: 2px solid #2563eb; }
+
+.grade-mes-header { cursor: pointer; user-select: none; }
+.grade-mes-header td {
+    padding: 8px 10px;
+    background: #f7f7f5;
+    font-weight: 600;
+    color: #555;
+    border-top: 1px solid #eee;
+}
+.grade-mes-header:hover td { background: #f0f0ee; }
+
 .template-results { margin-top: 1rem; }
 .template-item {
     display: flex;
@@ -1161,6 +1255,7 @@ body {
         <button class="tab active" onclick="switchTab('template', this)">Gerar template</button>
         <button class="tab" onclick="switchTab('processar', this)">Processar scan</button>
         <button class="tab" onclick="switchTab('recuperar', this)">Recuperar lote</button>
+        <button class="tab" onclick="switchTab('limpar', this)">Limpar lotes antigos</button>
     </div>
 
     <!-- ABA: GERAR TEMPLATE -->
@@ -1253,32 +1348,51 @@ body {
     <div class="panel" id="panel-processar">
         <form id="form-processar" onsubmit="return submitProcessar(event)">
             <div class="section">
-                <div class="label">Restaurante</div>
-                <div class="radio-group">
-                    <label class="radio selected" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="canela" checked> Canela
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="ondina"> Ondina
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="sao_lazaro"> São Lázaro
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="canela_fds"> Canela FDS
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="sao_lazaro_fds"> S. Lázaro FDS
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="canela_fds_especial"> Canela FDS Esp.
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="sao_lazaro_fds_especial"> S. Lázaro FDS Esp.
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-processar')">
-                        <input type="radio" name="rest-processar" value="ondina_fds_especial"> Ondina Esp.
-                    </label>
+                <div class="label">Qual semana e restaurante você vai processar?</div>
+                <div class="upload-hint" style="margin-bottom:10px;">
+                    Clique na semana e no restaurante da folha que está na sua mão agora —
+                    isso escolhe os dois de uma vez.
+                    <span style="color:#1a7a3c;font-weight:600;">●</span> pronto pra processar &nbsp;
+                    <span style="color:#999;font-weight:600;">✓</span> já processado nesta semana &nbsp;
+                    <span style="color:#ccc;font-weight:600;">—</span> não existe lote
+                </div>
+                <div id="grade-lotes-wrap">
+                    <div style="color:#888;font-size:13px;padding:10px 0;">Carregando lotes...</div>
+                </div>
+                <div id="grade-lote-escolha" style="display:none;margin-top:8px;"></div>
+                <div id="lote-detalhe" style="font-size:12px;color:#888;margin-top:8px;"></div>
+
+                <!-- Estado interno: guarda a escolha feita na grade acima. Não aparece na
+                     tela — o resto do formulário (submitProcessar, onLoteChange) continua
+                     lendo daqui, sem precisar saber que existe uma grade. -->
+                <div style="display:none;">
+                    <input type="hidden" id="select-lote" value="">
+                    <div class="radio-group">
+                        <label class="radio selected" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="canela" checked> Canela
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="ondina"> Ondina
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="sao_lazaro"> São Lázaro
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="canela_fds"> Canela FDS
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="sao_lazaro_fds"> S. Lázaro FDS
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="canela_fds_especial"> Canela FDS Esp.
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="sao_lazaro_fds_especial"> S. Lázaro FDS Esp.
+                        </label>
+                        <label class="radio" onclick="selectRadio(this, 'rest-processar')">
+                            <input type="radio" name="rest-processar" value="ondina_fds_especial"> Ondina Esp.
+                        </label>
+                    </div>
                 </div>
             </div>
 
@@ -1297,28 +1411,14 @@ body {
             </div>
 
             <div class="section">
-                <div class="label">Lote impresso que originou este scan</div>
-                <select id="select-lote" onchange="onLoteChange()"
-                        style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;background:#fff;">
-                    <option value="">Carregando lotes...</option>
-                </select>
-                <div id="lote-detalhe" style="font-size:12px;color:#888;margin-top:6px;"></div>
-                <div class="upload-hint" style="margin-top:6px;">
-                    O lote guarda quem estava em cada linha no dia da impressão.
-                    É ele que garante que a presença vá para a pessoa certa mesmo
-                    que a planilha tenha mudado depois. O código do lote está
-                    impresso no rodapé da folha.
-                </div>
-            </div>
-
-            <div class="section">
                 <div style="font-size:12px;color:#999;cursor:pointer;user-select:none;"
                      onclick="toggleLegado()" id="legado-toggle">▸ Folha antiga, sem código de lote?</div>
                 <div id="legado-box" style="display:none;margin-top:10px;">
                     <div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;padding:10px 12px;font-size:12px;color:#7a5a10;margin-bottom:10px;">
                         Sem lote, os nomes voltam a sair da planilha enviada agora.
                         Se ela mudou desde a impressão, as presenças saem trocadas.
-                        Prefira reconstruir o lote com <code>recuperar_lote.py</code>.
+                        Prefira recuperar o lote pela aba <b>Recuperar lote</b> — ela
+                        reconstrói automaticamente, sem precisar disso aqui.
                     </div>
                     <div class="label">Planilha de alunos (.xlsx)</div>
                     <div id="upload-alunos-zone" class="upload-zone">
@@ -1432,21 +1532,41 @@ body {
             </div>
 
             <div class="section">
-                <div class="label">Pasta com os scans preenchidos</div>
-                <input type="text" id="input-pasta-scans" placeholder="C:\\caminho\\para\\os\\scans"
-                       style="width:100%;max-width:480px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;box-sizing:border-box;">
+                <div class="label">Scans preenchidos <span style="font-weight:400;color:#aaa">(pode selecionar vários PDFs de uma vez — abra a pasta no Explorer, dê Ctrl+A e arraste todos pra cá)</span></div>
+                <div id="zone-recuperar-scans" class="upload-zone"
+                     ondragover="event.preventDefault();this.classList.add('dragover');"
+                     ondragleave="this.classList.remove('dragover');"
+                     ondrop="onBucketDrop(event, 'recuperar-scans')">
+                    <input type="file" accept=".pdf" multiple onchange="onBucketSelected(this, 'recuperar-scans')">
+                    <div class="upload-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
+                    </div>
+                    <div class="upload-text" id="texto-recuperar-scans">Arraste os PDFs aqui ou clique para selecionar</div>
+                    <div class="upload-hint">.pdf escaneado — quantos precisar, de qualquer restaurante e período</div>
+                </div>
+                <div id="info-recuperar-scans" style="font-size:12px;color:#666;margin-top:6px;"></div>
             </div>
 
             <div class="section">
-                <div class="label">Pasta com os templates originais <span style="font-weight:400;color:#aaa">(opcional — sem ela, tenta reconstruir lendo o próprio scan)</span></div>
-                <input type="text" id="input-pasta-templates" placeholder="C:\\caminho\\para\\os\\templates"
-                       style="width:100%;max-width:480px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;box-sizing:border-box;">
+                <div class="label">Templates originais (as folhas em branco, geradas pelo sistema) <span style="font-weight:400;color:#aaa">(opcional — sem eles, tenta reconstruir lendo o próprio scan)</span></div>
+                <div id="zone-recuperar-templates" class="upload-zone"
+                     ondragover="event.preventDefault();this.classList.add('dragover');"
+                     ondragleave="this.classList.remove('dragover');"
+                     ondrop="onBucketDrop(event, 'recuperar-templates')">
+                    <input type="file" accept=".pdf" multiple onchange="onBucketSelected(this, 'recuperar-templates')">
+                    <div class="upload-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
+                    </div>
+                    <div class="upload-text" id="texto-recuperar-templates">Arraste os PDFs aqui ou clique para selecionar</div>
+                    <div class="upload-hint">opcional — melhora a chance de recuperar certo</div>
+                </div>
+                <div id="info-recuperar-templates" style="font-size:12px;color:#666;margin-top:6px;"></div>
             </div>
 
             <div style="font-size:12px;color:#999;margin-bottom:14px;">
                 O sistema lê o cabeçalho impresso em cada folha pra descobrir sozinho de qual
-                restaurante e período é cada scan — não importa o nome do arquivo. Com muitos
-                scans pode levar alguns minutos.
+                restaurante e período é cada scan — não importa o nome do arquivo nem a ordem
+                em que você selecionou. Com muitos scans pode levar alguns minutos.
             </div>
 
             <button type="submit" class="btn" id="btn-recuperar">Buscar e recuperar</button>
@@ -1460,6 +1580,36 @@ body {
         <div class="error-msg" id="error-recuperar"></div>
 
         <div class="template-results" id="result-recuperar"></div>
+    </div>
+
+    <!-- ABA: LIMPAR LOTES ANTIGOS -->
+    <div class="panel" id="panel-limpar">
+        <div style="font-size:12px;color:#999;margin-bottom:14px;">
+            Cada lote processado fica guardado em disco (roster + PDF) como histórico
+            auditável, mesmo depois de sincronizado com o Sheets — isso nunca é
+            apagado sozinho. Aqui você escolhe a partir de quantos dias um lote
+            <strong>já sincronizado</strong> pode ser apagado, confere a lista exata
+            antes de decidir, e só então apaga. Lote não sincronizado nunca aparece
+            aqui — continua guardado pra permitir reprocessar sem reescanear.
+        </div>
+
+        <form id="form-limpar" onsubmit="return submitLimparPreview(event)">
+            <div class="section">
+                <div class="label">Apagar lotes sincronizados há mais de quantos dias</div>
+                <input type="number" id="input-dias-retencao" value="180" min="0" step="1"
+                       style="width:120px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;box-sizing:border-box;">
+            </div>
+            <button type="submit" class="btn" id="btn-limpar-preview">Ver o que seria apagado</button>
+        </form>
+
+        <div class="loading" id="loading-limpar">
+            <div class="spinner"></div>
+            Procurando lotes...
+        </div>
+
+        <div class="error-msg" id="error-limpar"></div>
+
+        <div id="result-limpar"></div>
     </div>
 </div>
 
@@ -1493,6 +1643,49 @@ function selectRadio(el, name) {
 
 function toggleDiaEspecial(el) {
     el.classList.toggle('selected');
+}
+
+// --- Zonas de upload de vários PDFs de uma vez (sem ordem/mesclagem) ---
+var uploadBuckets = { 'recuperar-scans': [], 'recuperar-templates': [] };
+
+function onBucketSelected(input, bucket) {
+    adicionarNoBucket(bucket, input.files);
+    input.value = '';
+}
+
+function onBucketDrop(e, bucket) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('zone-' + bucket).classList.remove('dragover');
+    adicionarNoBucket(bucket, e.dataTransfer.files);
+}
+
+function adicionarNoBucket(bucket, fileList) {
+    for (var i = 0; i < fileList.length; i++) {
+        if (fileList[i].name.toLowerCase().endsWith('.pdf')) {
+            uploadBuckets[bucket].push(fileList[i]);
+        }
+    }
+    renderBucket(bucket);
+}
+
+function limparBucket(bucket) {
+    uploadBuckets[bucket] = [];
+    renderBucket(bucket);
+}
+
+function renderBucket(bucket) {
+    var info = document.getElementById('info-' + bucket);
+    var texto = document.getElementById('texto-' + bucket);
+    var n = uploadBuckets[bucket].length;
+    if (n === 0) {
+        info.innerHTML = '';
+        texto.textContent = 'Arraste os PDFs aqui ou clique para selecionar';
+        return;
+    }
+    texto.textContent = '+ Adicionar mais PDFs';
+    info.innerHTML = n + (n === 1 ? ' arquivo selecionado' : ' arquivos selecionados') +
+        ' — <a href="#" onclick="limparBucket(&#39;' + bucket + '&#39;); return false;" style="color:#dc2626;">limpar</a>';
 }
 
 // --- Scan multi-parte ---
@@ -1667,27 +1860,24 @@ function submitTemplate(e) {
 function submitRecuperar(e) {
     e.preventDefault();
 
-    var pastaScans = document.getElementById('input-pasta-scans').value.trim();
-    if (!pastaScans) {
-        showError('recuperar', 'Informe a pasta com os scans preenchidos.');
+    var scans = uploadBuckets['recuperar-scans'] || [];
+    if (!scans.length) {
+        showError('recuperar', 'Selecione os PDFs escaneados (arraste-os pra caixa acima).');
         return false;
     }
-    var pastaTemplates = document.getElementById('input-pasta-templates').value.trim();
+    var templates = uploadBuckets['recuperar-templates'] || [];
     var rest = document.querySelector('input[name="rest-recuperar"]:checked').value;
+
+    var data = new FormData();
+    scans.forEach(function(f) { data.append('scans', f); });
+    templates.forEach(function(f) { data.append('templates', f); });
+    data.set('restaurante', rest);
 
     showLoading('recuperar', true);
     hideError('recuperar');
     document.getElementById('result-recuperar').innerHTML = '';
 
-    fetch('/recuperar_lotes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            pasta_scans: pastaScans,
-            pasta_templates: pastaTemplates,
-            restaurante: rest,
-        }),
-    })
+    fetch('/recuperar_lotes', { method: 'POST', body: data })
         .then(r => r.json())
         .then(data => {
             showLoading('recuperar', false);
@@ -1696,6 +1886,8 @@ function submitRecuperar(e) {
                 return;
             }
             renderResultadosRecuperar(data.resultados || []);
+            limparBucket('recuperar-scans');
+            limparBucket('recuperar-templates');
             // Os lotes recem-recuperados precisam aparecer em "Processar scan" sem F5.
             carregarLotes();
         })
@@ -1764,55 +1956,389 @@ function renderResultadosRecuperar(resultados) {
     el.innerHTML = html;
 }
 
-var lotesCarregados = [];
+// --- Limpar lotes antigos ---------------------------------------------
 
-function carregarLotes() {
-    var sel = document.getElementById('select-lote');
-    if (!sel) return;
-    var rest = document.querySelector('input[name="rest-processar"]:checked').value;
-    sel.innerHTML = '<option value="">Carregando...</option>';
-    document.getElementById('lote-detalhe').textContent = '';
+function submitLimparPreview(e) {
+    e.preventDefault();
 
-    fetch('/lotes?restaurante=' + encodeURIComponent(rest))
+    var dias = parseInt(document.getElementById('input-dias-retencao').value, 10);
+    if (isNaN(dias) || dias < 0) {
+        showError('limpar', 'Informe um número de dias válido.');
+        return false;
+    }
+
+    showLoading('limpar', true);
+    hideError('limpar');
+    document.getElementById('result-limpar').innerHTML = '';
+
+    fetch('/lotes_limpar_preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dias: dias }),
+    })
         .then(r => r.json())
         .then(data => {
-            lotesCarregados = data.lotes || [];
-            if (!lotesCarregados.length) {
-                sel.innerHTML = '<option value="">Nenhum lote impresso para este restaurante</option>';
-                document.getElementById('lote-detalhe').innerHTML =
-                    '<span style="color:#b57c10;">Gere o template por aqui para que o lote passe a ser registrado.</span>';
+            showLoading('limpar', false);
+            if (data.erro) {
+                showError('limpar', data.erro);
                 return;
             }
-            var html = '<option value="">- selecione o lote -</option>';
-            lotesCarregados.forEach(function(l) {
-                var rotulo = (l.datas || l.criado_em.slice(0, 10)) +
-                             '  |  ' + l.total_alunos + ' alunos' +
-                             '  |  ' + l.lote_id;
-                if (l.processado) rotulo += '  (ja processado)';
-                if (l.origem !== 'geracao') rotulo += '  [' + l.origem + ']';
-                html += '<option value="' + l.lote_id + '">' + rotulo + '</option>';
-            });
-            sel.innerHTML = html;
-            // Um unico lote ativo quase sempre e o certo - pre-seleciona.
-            var ativos = lotesCarregados.filter(function(l) { return !l.processado; });
-            if (ativos.length === 1) {
-                sel.value = ativos[0].lote_id;
-                onLoteChange();
+            renderCandidatosLimpar(data.candidatos || [], dias);
+        })
+        .catch(function(err) {
+            showLoading('limpar', false);
+            showError('limpar', 'Erro de conexão: ' + err.message);
+        });
+
+    return false;
+}
+
+function renderCandidatosLimpar(candidatos, dias) {
+    var el = document.getElementById('result-limpar');
+
+    if (!candidatos.length) {
+        el.innerHTML = '<div style="color:#888;font-size:14px;padding:12px 0;">' +
+            'Nenhum lote sincronizado passa de ' + dias + ' dias. Nada a apagar.</div>';
+        return;
+    }
+
+    var html = '<div style="font-size:13px;color:#333;margin-bottom:10px;">' +
+        candidatos.length + ' lote(s) encontrado(s) — todos já sincronizados com o ' +
+        'Sheets, mais antigos que ' + dias + ' dias:</div>';
+
+    html += '<div style="max-height:280px;overflow-y:auto;border:1px solid #e5e5e3;border-radius:8px;margin-bottom:14px;">';
+    candidatos.forEach(function(c) {
+        html += '<div class="template-item" style="flex-direction:column;align-items:stretch;">';
+        html += '  <div style="display:flex;justify-content:space-between;">';
+        html += '    <div><div>' + c.restaurante + ' — ' + (c.periodo || c.datas || '(sem período)') + '</div>';
+        html += '      <div class="template-info">' + c.total_alunos + ' pessoas  |  lote ' + c.lote_id + '</div>';
+        html += '    </div>';
+        html += '    <span style="font-size:12px;color:#999;white-space:nowrap;">desde ' + c.ultimo_processamento.slice(0, 10) + '</span>';
+        html += '  </div></div>';
+    });
+    html += '</div>';
+
+    html += '<div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;padding:10px 12px;margin-bottom:10px;">';
+    html += '  <label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;color:#7a5a10;cursor:pointer;">';
+    html += '    <input type="checkbox" id="chk-confirma-limpeza" onchange="document.getElementById(&#39;btn-limpar-aplicar&#39;).disabled = !this.checked;" style="margin-top:2px;">';
+    html += '    <span>Entendo que isso apaga os arquivos (roster e PDF) desses ' + candidatos.length +
+            ' lote(s) <b>permanentemente do disco</b> — não tem como desfazer, e a folha impressa ' +
+            'precisaria ser reescaneada do zero pra recuperar o histórico.</span>';
+    html += '  </label>';
+    html += '</div>';
+
+    html += '<button type="button" class="btn" id="btn-limpar-aplicar" disabled ' +
+            'onclick="confirmarLimpeza(' + dias + ', ' + candidatos.length + ')" ' +
+            'style="background:#dc2626;">Apagar ' + candidatos.length + ' lote(s)</button>';
+
+    el.innerHTML = html;
+}
+
+function confirmarLimpeza(dias, total) {
+    var btn = document.getElementById('btn-limpar-aplicar');
+    btn.disabled = true;
+    btn.textContent = 'Apagando...';
+
+    fetch('/lotes_limpar_aplicar', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dias: dias, confirmar: true }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            if (data.erro) {
+                showError('limpar', data.erro);
+                btn.disabled = false;
+                btn.textContent = 'Apagar ' + total + ' lote(s)';
+                return;
             }
+            document.getElementById('result-limpar').innerHTML =
+                '<div style="color:#1a7a3c;font-size:14px;padding:12px 0;">✓ ' +
+                (data.apagados || []).length + ' lote(s) apagado(s).</div>';
+        })
+        .catch(function(err) {
+            showError('limpar', 'Erro de conexão: ' + err.message);
+            btn.disabled = false;
+            btn.textContent = 'Apagar ' + total + ' lote(s)';
+        });
+}
+
+var lotesCarregados = [];
+
+// Restaurantes-base da grade, na ordem das colunas. Uma variante FDS
+// (ex: "canela_fds_especial") pertence à coluna do restaurante-base cujo
+// prefixo bate — mesmo agrupamento que RESTAURANTES no lado do Python.
+var RESTAURANTES_BASE = [
+    ['canela', 'Canela'],
+    ['ondina', 'Ondina'],
+    ['sao_lazaro', 'São Lázaro'],
+];
+
+// Espelha `_data_inicio_periodo` em google_sheets.py: pega a primeira
+// data DD/MM (ou DD/MM/AAAA) no texto livre do período, pra ordenar a
+// grade cronologicamente — o texto varia ("05/05 a 09/05", "01/08",
+// "05/07 e 07/07"), mas todos começam com uma data reconhecível.
+function dataInicioPeriodo(periodo) {
+    var m = /(\\d{1,2})\\s*[/.]\\s*(\\d{1,2})(?:\\s*[/.]\\s*(\\d{2,4}))?/.exec(periodo || '');
+    if (!m) return null;
+    var dd = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+    var ano;
+    if (m[3]) {
+        ano = parseInt(m[3], 10);
+        if (ano < 100) ano += 2000;
+    } else {
+        var hoje = new Date();
+        ano = mm <= (hoje.getMonth() + 1) ? hoje.getFullYear() : hoje.getFullYear() - 1;
+    }
+    var d = new Date(ano, mm - 1, dd);
+    return isNaN(d.getTime()) ? null : d.getTime();
+}
+
+var MESES_PT = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+                'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+
+function mesAnoDoPeriodo(periodo) {
+    var ts = dataInicioPeriodo(periodo);
+    if (ts === null) return 'Sem data';
+    var d = new Date(ts);
+    return MESES_PT[d.getMonth()] + ' ' + d.getFullYear();
+}
+
+// Meses com as linhas visíveis na grade. null = ainda não inicializado —
+// o primeiro render abre só o mês mais recente, pra não afogar a tela
+// com semanas antigas. Fica no módulo (não dentro de renderGradeLotes)
+// pra sobreviver a um re-render (ex: depois de recuperar um lote novo).
+var mesesAbertos = null;
+
+function toggleMesGrade(mes) {
+    if (mesesAbertos.has(mes)) {
+        mesesAbertos.delete(mes);
+    } else {
+        mesesAbertos.add(mes);
+    }
+    renderGradeLotes();
+}
+
+function restauranteBase(key) {
+    for (var i = 0; i < RESTAURANTES_BASE.length; i++) {
+        if (key.indexOf(RESTAURANTES_BASE[i][0]) === 0) return RESTAURANTES_BASE[i][0];
+    }
+    return key;
+}
+
+// `/lotes` pode listar o mesmo lote_id duas vezes (uma cópia solta na pasta
+// ativa e outra já arquivada — resíduo de dados, achado testando com o
+// acervo real). Sem isso, a grade mostraria "mais de um lote" onde na
+// verdade é só um, com uma cópia desatualizada por perto.
+function dedupPorLoteId(lotes) {
+    var porId = {};
+    lotes.forEach(function(l) {
+        var atual = porId[l.lote_id];
+        if (!atual || (l.processado && !atual.processado)) {
+            porId[l.lote_id] = l;
+        }
+    });
+    return Object.values(porId);
+}
+
+function carregarLotes() {
+    var wrap = document.getElementById('grade-lotes-wrap');
+    if (!wrap) return;
+    wrap.innerHTML = '<div style="color:#888;font-size:13px;padding:10px 0;">Carregando lotes...</div>';
+    document.getElementById('lote-detalhe').innerHTML = '';
+    document.getElementById('grade-lote-escolha').style.display = 'none';
+
+    fetch('/lotes?limite=300')
+        .then(r => r.json())
+        .then(data => {
+            lotesCarregados = dedupPorLoteId(data.lotes || []);
+            renderGradeLotes();
         })
         .catch(function() {
-            sel.innerHTML = '<option value="">Erro ao listar lotes</option>';
+            wrap.innerHTML = '<div style="color:#dc2626;font-size:13px;">Erro ao listar lotes.</div>';
         });
+}
+
+function renderGradeLotes() {
+    var wrap = document.getElementById('grade-lotes-wrap');
+
+    if (!lotesCarregados.length) {
+        wrap.innerHTML = '<div style="color:#b57c10;font-size:13px;padding:10px 0;">' +
+            'Nenhum lote impresso ainda. Gere um template na aba <b>Gerar template</b>, ' +
+            'ou recupere um pela aba <b>Recuperar lote</b>.</div>';
+        return;
+    }
+
+    // Agrupa por período (linha) e, dentro dele, por restaurante-base (coluna).
+    var porPeriodo = {};
+    lotesCarregados.forEach(function(l) {
+        var periodo = l.datas || l.criado_em.slice(0, 10);
+        var base = restauranteBase(l.restaurante_key);
+        porPeriodo[periodo] = porPeriodo[periodo] || {};
+        porPeriodo[periodo][base] = porPeriodo[periodo][base] || [];
+        porPeriodo[periodo][base].push(l);
+    });
+
+    // Linhas mais recentes primeiro — pela data do PERÍODO em si (não pela
+    // data em que o lote foi criado/recuperado: muitos lotes de semanas
+    // diferentes são recuperados no mesmo dia, o que embaralhava a grade).
+    var periodos = Object.keys(porPeriodo).sort(function(a, b) {
+        var da = dataInicioPeriodo(a);
+        var db = dataInicioPeriodo(b);
+        if (da !== null && db !== null) return db - da;
+        if (da !== null) return -1;
+        if (db !== null) return 1;
+        return 0;
+    });
+
+    // Agrupa os períodos (já ordenados) por mês, preservando a ordem —
+    // meses consecutivos na lista sempre caem juntos.
+    var meses = [];
+    var porMes = {};
+    periodos.forEach(function(periodo) {
+        var mes = mesAnoDoPeriodo(periodo);
+        if (!porMes[mes]) {
+            porMes[mes] = [];
+            meses.push(mes);
+        }
+        porMes[mes].push(periodo);
+    });
+
+    // Primeiro carregamento: só o mês mais recente começa aberto.
+    if (mesesAbertos === null) {
+        mesesAbertos = new Set(meses.length ? [meses[0]] : []);
+    }
+
+    var html = '<div style="overflow-x:auto;"><table style="border-collapse:collapse;width:100%;font-size:13px;">';
+    html += '<tr><th style="text-align:left;padding:6px 10px;color:#999;font-weight:500;">Semana</th>';
+    RESTAURANTES_BASE.forEach(function(r) {
+        html += '<th style="text-align:center;padding:6px 10px;color:#999;font-weight:500;">' + r[1] + '</th>';
+    });
+    html += '</tr>';
+
+    meses.forEach(function(mes) {
+        var periodosDoMes = porMes[mes];
+        var aberto = mesesAbertos.has(mes);
+        var temPronto = periodosDoMes.some(function(periodo) {
+            return RESTAURANTES_BASE.some(function(r) {
+                return (porPeriodo[periodo][r[0]] || []).some(function(l) { return !l.processado; });
+            });
+        });
+
+        var mesEscapado = JSON.stringify(mes).replace(/"/g, '&quot;');
+        html += '<tr class="grade-mes-header" onclick="toggleMesGrade(' + mesEscapado + ')">';
+        html += '  <td colspan="' + (1 + RESTAURANTES_BASE.length) + '">' +
+                (aberto ? '▾' : '▸') + ' ' + mes +
+                ' <span style="font-weight:400;color:#999;">(' + periodosDoMes.length +
+                (periodosDoMes.length === 1 ? ' semana)' : ' semanas)') + '</span>' +
+                (!aberto && temPronto ? ' <span style="color:#1a7a3c;">●</span>' : '') +
+                '</td>';
+        html += '</tr>';
+
+        if (aberto) {
+            periodosDoMes.forEach(function(periodo) {
+                html += '<tr>';
+                html += '<td style="padding:6px 10px 6px 22px;border-top:1px solid #eee;">' + periodo + '</td>';
+                RESTAURANTES_BASE.forEach(function(r) {
+                    var lotesCelula = (porPeriodo[periodo][r[0]] || []);
+                    html += '<td style="text-align:center;padding:6px 10px;border-top:1px solid #eee;">' +
+                            renderCelulaGrade(lotesCelula) + '</td>';
+                });
+                html += '</tr>';
+            });
+        }
+    });
+    html += '</table></div>';
+
+    wrap.innerHTML = html;
+
+    // Reabrir/fechar um mês reconstrói a tabela inteira — se já havia um
+    // lote escolhido, o destaque visual da célula se perderia sem isso.
+    var idSelecionado = document.getElementById('select-lote').value;
+    if (idSelecionado) destacarCelulaGrade(idSelecionado);
+
+    // Só um lote pronto em todo o mapa: já pré-seleciona, poupa o clique.
+    var prontos = lotesCarregados.filter(function(l) { return !l.processado; });
+    if (prontos.length === 1) {
+        aplicarEscolhaLote(prontos[0]);
+    }
+}
+
+function renderCelulaGrade(lotes) {
+    if (!lotes.length) {
+        return '<span style="color:#ccc;">—</span>';
+    }
+    var prontos = lotes.filter(function(l) { return !l.processado; });
+    var simbolo = prontos.length
+        ? '<span style="color:#1a7a3c;font-weight:600;">●</span>'
+        : '<span style="color:#999;font-weight:600;">✓</span>';
+    var ids = lotes.map(function(l) { return l.lote_id; });
+    var idsJson = JSON.stringify(ids).replace(/"/g, '&quot;');
+    var idsAttr = ids.join(',');
+    return '<span onclick="onCelulaGradeClick(' + idsJson + ')" class="grade-lote-cel" data-lote-ids="' + idsAttr + '">' +
+           simbolo + '</span>';
+}
+
+function onCelulaGradeClick(loteIds) {
+    var lotes = loteIds.map(function(id) {
+        return lotesCarregados.filter(function(l) { return l.lote_id === id; })[0];
+    }).filter(Boolean);
+
+    if (lotes.length === 1) {
+        aplicarEscolhaLote(lotes[0]);
+        return;
+    }
+
+    // Mais de um lote na mesma célula (ex: semana normal + FDS especial
+    // sobrepostos) — deixa a pessoa escolher em vez de decidir sozinho.
+    var escolha = document.getElementById('grade-lote-escolha');
+    var html = '<div style="font-size:12px;color:#666;margin-bottom:6px;">Mais de um lote pra essa semana — qual?</div>';
+    lotes.forEach(function(l) {
+        var idEscapado = JSON.stringify(l.lote_id).replace(/"/g, '&quot;');
+        html += '<div class="template-item" style="cursor:pointer;margin-bottom:6px;" ' +
+                'onclick="aplicarEscolhaLotePorId(' + idEscapado + ')">' +
+                '<div>' + l.restaurante_nome + (l.processado ? ' (já processado)' : '') + '</div>' +
+                '<div class="template-info">' + l.total_alunos + ' pessoas</div></div>';
+    });
+    escolha.innerHTML = html;
+    escolha.style.display = '';
+}
+
+function aplicarEscolhaLotePorId(id) {
+    var l = lotesCarregados.filter(function(x) { return x.lote_id === id; })[0];
+    if (l) aplicarEscolhaLote(l);
+}
+
+function aplicarEscolhaLote(l) {
+    var radio = document.querySelector('input[name="rest-processar"][value="' + l.restaurante_key + '"]');
+    if (radio) radio.checked = true;
+    document.getElementById('select-lote').value = l.lote_id;
+    document.getElementById('grade-lote-escolha').style.display = 'none';
+    onLoteChange();
+    destacarCelulaGrade(l.lote_id);
+}
+
+function destacarCelulaGrade(loteId) {
+    document.querySelectorAll('.grade-lote-cel-selecionada').forEach(function(el) {
+        el.classList.remove('grade-lote-cel-selecionada');
+    });
+    document.querySelectorAll('.grade-lote-cel').forEach(function(el) {
+        if ((el.getAttribute('data-lote-ids') || '').split(',').indexOf(loteId) !== -1) {
+            el.classList.add('grade-lote-cel-selecionada');
+        }
+    });
 }
 
 function onLoteChange() {
     var sel = document.getElementById('select-lote');
     var det = document.getElementById('lote-detalhe');
     var l = lotesCarregados.filter(function(x) { return x.lote_id === sel.value; })[0];
-    if (!l) { det.textContent = ''; return; }
+    if (!l) { det.innerHTML = ''; return; }
 
-    var txt = l.total_alunos + ' pessoas em ' + l.total_paginas + ' pagina(s) - dias: ' +
-              (l.dias || []).join(', ') + ' - impresso em ' + l.criado_em.replace('T', ' ');
+    var txt = '<div style="color:#1a1a1a;font-weight:600;margin-bottom:2px;">Selecionado: ' +
+              l.restaurante_nome + ' — ' + (l.datas || l.criado_em.slice(0, 10)) + '</div>';
+    txt += l.total_alunos + ' pessoas em ' + l.total_paginas + ' página(s) — dias: ' +
+           (l.dias || []).join(', ') + ' — impresso em ' + l.criado_em.replace('T', ' ');
     if (l.tem_pdf) {
         txt += ' - <a href="/lote/' + l.lote_id + '/pdf" target="_blank" style="color:#666;">reimprimir</a>';
     }
@@ -1902,6 +2428,9 @@ function submitProcessar(e) {
             if (data.divergencia && data.divergencia.resumo) {
                 avisos.push('Comparado com a planilha enviada: ' + data.divergencia.resumo +
                             '. As presenças foram atribuídas pelo lote impresso, não por ela.');
+            }
+            if (data.sheets_aviso_matricula) {
+                avisos.push(data.sheets_aviso_matricula);
             }
             mostrarAvisos(avisos);
 
@@ -2026,6 +2555,9 @@ function substituirSemana() {
             } else {
                 msg.textContent = '✓ Exportado (' + (data.aba || '') + ')';
                 msg.className = 'result-value result-ok';
+                if (data.sheets_aviso_matricula) {
+                    mostrarAvisos([data.sheets_aviso_matricula]);
+                }
             }
         })
         .catch(function() {

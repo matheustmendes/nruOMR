@@ -4,6 +4,20 @@
 
 ---
 
+## ⚠ DIREÇÃO DO PROJETO — guinada anunciada (2026-09-16)
+
+Decisão anunciada pelo usuário: abandonar a impressão das listas em papel e
+migrar para **outro sistema, mais simples**, reaproveitando as regras de
+negócio já validadas aqui (identidade por lote, detecção de matrícula
+duplicada, cálculo de presença/período, estrutura da planilha) mas sem OMR,
+sem scan, sem `lote_sync`/`recuperar_lote`/`corrigir_passivo` — todo esse
+aparato existe só por causa do papel. Ainda não começou; nada foi decidido
+sobre a nova arquitetura (app web direto? totem? app do bolsista?). Ao
+planejar isso, tratar como projeto novo que consome as regras de negócio
+deste, não como refactor incremental do pipeline de scan.
+
+---
+
 ## ▶ PRÓXIMA SESSÃO — UX do fluxo de lote
 
 Sincronização de lotes entre máquinas **implementada e ativa** (2026-09-10)
@@ -85,6 +99,8 @@ estiverem reconciliados, nunca no meio (desloca as linhas de baixo).
 
 ## Melhorias
 
+- [x] **Fallback de matrícula não encontrada via planilha de bolsistas.** Implementado (2026-09-16): `recuperar_lote.carregar_cadastro_bolsistas()` lê a planilha oficial de bolsistas (spreadsheet_id em `config_sheets.yaml`, chave `bolsistas`), abas ONDINA/CANELA/SÃO LÁZARO (cabeçalho localizado dinamicamente pela célula "MATRÍCULA" — o layout varia entre abas). Entra em `cadastro_combinado()` por último e só com `setdefault` — preenche matrícula que planilha de impressão/histórico do Sheets não conhecem, nunca sobrepõe nome já resolvido. Testado contra a planilha real: 1312 matrículas carregadas das três abas. CLI: `--sem-bolsistas` desativa, espelhando `--sem-sheets`.
+  - **Extensão (2026-09-16): busca por nome quando a matrícula não bate de jeito nenhum.** `extrair_do_scan` agora lê por OCR a coluna do nome (só quando a matrícula falhou tanto exata quanto por 1 dígito) e busca no cadastro combinado (que já inclui os bolsistas) pelo nome mais parecido via `_melhor_candidato_nome` — só resolve sozinho quando o melhor candidato se destaca claramente do segundo (mesmo critério de segurança usado para matrícula). Nova situação `"por_nome"` no JSON do lote, com `nome_ocr` e `candidatos_nome` para conferência manual quando não resolve. **Não testado contra scan real** (só a lógica de comparação de nomes, offline) — a geometria do recorte da coluna do nome (`geo["nome_x1"]/["nome_x2"]`) é estimada a partir da mesma fórmula de `gerar_template.calcular_posicoes_colunas`, sem validar contra uma imagem de verdade. Testar no próximo caso real de `sem_match` antes de confiar cegamente.
 - [ ] **Trocar geração de xlsx temporário pela planilha existente no projeto** — exportação cria xlsx novo a cada processamento; substituir pelo arquivo já existente.
 - [x] **Executável para iniciar o projeto inteiro** — sobe `web.py` (5000) e `dashboard.py` (5001) juntos. (`Iniciar Sistema Completo.bat`)
 - [x] **Snapshot de lote de impressão** — PDF e roster nascem juntos em `lotes/`, com a geometria congelada. Código do lote impresso no rodapé da folha. Ver LOTES.md.

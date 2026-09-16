@@ -211,9 +211,11 @@ def _geometria_texto(config: dict):
     primeiro_circulo_x = min(
         layout["circulos_por_dia"][d]["almoco_x"] for d in dias
     )
+    matricula_x2 = primeiro_circulo_x - raio_mm - 2.0  # antes do 1º círculo
     return {
-        "nome_x1": 15.0 + 6.0,                              # depois do "Nº"
-        "matricula_x2": primeiro_circulo_x - raio_mm - 2.0,  # antes do 1º círculo
+        "nome_x1": 15.0 + 6.0,                # depois do "Nº"
+        "nome_x2": matricula_x2 - 28.0,        # antes da coluna de matrícula
+        "matricula_x2": matricula_x2,
         "primeira_linha_y": layout["primeira_linha_y_mm"],
         "linha_altura": layout["linha_altura_mm"],
         "alunos_por_pagina": layout["alunos_por_pagina"],
@@ -227,7 +229,10 @@ def extrair_do_scan(caminhos_scan, config: dict, cadastro=None) -> dict:
 
     A matrícula é o alvo por ser só dígitos: com a whitelist do Tesseract o
     reconhecimento é muito mais estável do que o de nomes com acento. O nome
-    vem depois, do cadastro mestre — não do OCR.
+    vem depois, do cadastro mestre — não do OCR. Só quando a matrícula não
+    bate de jeito nenhum (nem exata, nem por 1 dígito de diferença) é que a
+    coluna do nome é lida por OCR, como último recurso, para achar a
+    matrícula da mesma pessoa pelo nome impresso — ver `_melhor_candidato_nome`.
 
     A posição de cada linha no lote **não** vem da ordem do arquivo. Vem do
     "Página X de Y" impresso na folha, com os buracos reconstruídos por
@@ -270,7 +275,7 @@ def extrair_do_scan(caminhos_scan, config: dict, cadastro=None) -> dict:
         return int(round((valor / 25.4) * dpi))
 
     paginacao, avisos = [], []
-    exatas = corrigidas = sem_match = 0
+    exatas = corrigidas = por_nome = sem_match = 0
 
     # Passo 1: alinhar tudo e descobrir a que página do lote cada imagem
     # corresponde, antes de ler qualquer matrícula.
@@ -341,14 +346,44 @@ def extrair_do_scan(caminhos_scan, config: dict, cadastro=None) -> dict:
             nome, situacao, matricula = "", "sem_match", lido
             if lido in cadastro:
                 nome, situacao = cadastro[lido], "exata"
-                exatas += 1
             elif cadastro:
                 candidato = _melhor_candidato(lido, cadastro)
                 if candidato:
                     matricula, nome, situacao = candidato, cadastro[candidato], "corrigida"
-                    corrigidas += 1
-                else:
-                    sem_match += 1
+
+            # Última tentativa: a matrícula não bateu de nenhuma forma, mas a
+            # pessoa está na mesma linha impressa — lê o nome ao lado por OCR
+            # e busca no cadastro por quem mais se parece, em vez de desistir.
+            nome_ocr = ""
+            if situacao == "sem_match" and cadastro:
+                xn1 = max(0, mm_px(geo["nome_x1"]))
+                xn2 = min(largura_img, mm_px(geo["nome_x2"]))
+                if xn2 > xn1:
+                    recorte_nome = cinza[y1:y2, xn1:xn2]
+                    _, bin_nome = cv2.threshold(recorte_nome, 0, 255,
+                                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    ampliado_nome = cv2.resize(bin_nome, None, fx=3, fy=3,
+                                               interpolation=cv2.INTER_CUBIC)
+                    try:
+                        nome_ocr = pytesseract.image_to_string(
+                            ampliado_nome, config="--psm 7 --oem 3",
+                        ).strip()
+                    except Exception:
+                        nome_ocr = ""
+
+                if nome_ocr:
+                    candidato_nome = _melhor_candidato_nome(nome_ocr, cadastro)
+                    if candidato_nome:
+                        matricula, nome, situacao = (
+                            candidato_nome, cadastro[candidato_nome], "por_nome"
+                        )
+
+            if situacao == "exata":
+                exatas += 1
+            elif situacao == "corrigida":
+                corrigidas += 1
+            elif situacao == "por_nome":
+                por_nome += 1
             else:
                 sem_match += 1
 
@@ -362,12 +397,18 @@ def extrair_do_scan(caminhos_scan, config: dict, cadastro=None) -> dict:
                 "ocr_bruto": lido,
                 "situacao": situacao,
             }
+            if nome_ocr:
+                registro["nome_ocr"] = nome_ocr
 
             # Sem correspondência automática, o trabalho manual fica muito mais
             # rápido com uma lista curta de candidatos do que com a matrícula
             # crua e o cadastro inteiro para vasculhar.
             if situacao == "sem_match" and cadastro:
                 registro["candidatos"] = _sugestoes(lido, cadastro)
+                if nome_ocr:
+                    candidatos_nome = _sugestoes_nome(nome_ocr, cadastro)
+                    if candidatos_nome:
+                        registro["candidatos_nome"] = candidatos_nome
 
             paginacao.append(registro)
 
@@ -389,12 +430,22 @@ def extrair_do_scan(caminhos_scan, config: dict, cadastro=None) -> dict:
             "cadastro (erro de um dígito no OCR). Confira as marcadas como "
             "'corrigida' no JSON do lote."
         )
+    if por_nome:
+        avisos.append(
+            f"{por_nome} matrícula(s) não bateram por dígito, mas foram "
+            "resolvidas pelo nome impresso na linha (OCR do nome casou com "
+            "folga contra um único nome do cadastro). Confira as marcadas "
+            "como 'por_nome' no JSON do lote."
+        )
 
     return {
         "paginacao": paginacao,
         "total_paginas": max(p["pagina"] for p in paginacao),
         "avisos": avisos,
-        "confianca": {"exatas": exatas, "corrigidas": corrigidas, "sem_match": sem_match},
+        "confianca": {
+            "exatas": exatas, "corrigidas": corrigidas,
+            "por_nome": por_nome, "sem_match": sem_match,
+        },
     }
 
 
@@ -436,8 +487,66 @@ def _sugestoes(lido: str, cadastro: dict, quantos: int = 5):
     ]
 
 
+def _melhor_candidato_nome(nome_lido: str, cadastro: dict):
+    """
+    Acha a matrícula do cadastro cujo nome mais se parece com o nome lido por
+    OCR na própria linha — último recurso quando a matrícula não bateu nem
+    exata nem por 1 dígito de diferença.
+
+    OCR de nome com acento tem muito mais ruído que o de dígitos (é por isso
+    que a matrícula é a leitura preferida, ver `extrair_do_scan`), então a
+    distância aceita cresce com o tamanho do nome em vez de ficar fixa em 1
+    como em `_melhor_candidato`. Só aceita quando o melhor candidato se
+    destaca claramente do segundo melhor — dois nomes parecidos demais
+    significam que não dá pra decidir com segurança, e chutar aqui é
+    exatamente o erro silencioso que este módulo existe para evitar.
+    """
+    alvo = lote_mod.norm_nome(nome_lido)
+    if not alvo:
+        return None
+
+    pontuados = sorted(
+        (_distancia(alvo, lote_mod.norm_nome(nome)), mat)
+        for mat, nome in cadastro.items()
+    )
+    if not pontuados:
+        return None
+
+    melhor_dist, melhor_mat = pontuados[0]
+    limiar = max(2, len(alvo) // 4)
+    if melhor_dist > limiar:
+        return None
+    if len(pontuados) > 1 and pontuados[1][0] <= melhor_dist + 1:
+        return None
+    return melhor_mat
+
+
+def _sugestoes_nome(nome_lido: str, cadastro: dict, quantos: int = 5):
+    """
+    Nomes do cadastro mais parecidos com o nome lido por OCR, para
+    conferência humana quando `_melhor_candidato_nome` não se arriscou.
+
+    Mesma lógica de `_sugestoes`, mas comparando nome normalizado em vez de
+    matrícula. Nada aqui é aplicado automaticamente — é material de decisão.
+    """
+    alvo = lote_mod.norm_nome(nome_lido)
+    if not alvo:
+        return []
+    pontuados = [
+        (_distancia(alvo, lote_mod.norm_nome(nome)), mat, nome)
+        for mat, nome in cadastro.items()
+    ]
+    pontuados.sort(key=lambda x: x[0])
+    return [
+        {"matricula": mat, "nome": nome, "distancia": dist}
+        for dist, mat, nome in pontuados[:quantos]
+    ]
+
+
 def _distancia(a: str, b: str) -> int:
-    """Levenshtein simples — as strings aqui têm no máximo ~12 caracteres."""
+    """Levenshtein simples — usado tanto para matrícula (~12 chars) quanto
+    para nome completo (~40 chars); o cadastro cabe inteiro na memória, então
+    não vale a pena complicar por causa do tamanho da string."""
     anterior = list(range(len(b) + 1))
     for i, ca in enumerate(a, start=1):
         atual = [i]
@@ -545,19 +654,104 @@ def carregar_cadastro_sheets(restaurantes=("canela", "ondina", "sao_lazaro")) ->
     return cadastro
 
 
-def cadastro_combinado(caminho_xlsx=None, usar_sheets=True) -> dict:
+_ABAS_BOLSISTAS = {"ondina", "canela", "sao lazaro"}
+
+
+def _normalizar_texto(valor: str) -> str:
+    """Sem acento, sem caixa, sem espaço nas pontas — só para casar rótulos."""
+    import unicodedata
+
+    txt = unicodedata.normalize("NFKD", str(valor or ""))
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    return txt.strip().lower()
+
+
+def carregar_cadastro_bolsistas(spreadsheet_id: str = None) -> dict:
     """
-    Junta a planilha de impressão com o histórico do Sheets.
+    Monta {matricula: nome} a partir da planilha oficial de bolsistas do RU.
+
+    É uma base mantida por fora deste sistema (PROAE), mais completa que o
+    cadastro mestre (planilha de impressão + histórico do Sheets): serve pra
+    resolver o caso em que uma matrícula lida por OCR não bate com nenhum dos
+    dois — a pessoa pode ser bolsista há pouco tempo e ainda não ter aparecido
+    em nenhuma exportação. Considera só as abas ONDINA, CANELA e SÃO LÁZARO;
+    as demais abas da planilha (removidos, inclusão semanal etc.) não são
+    cadastro de bolsista e ficam de fora.
+
+    O layout de cada aba varia (linha de título, linha de cabeçalho em
+    posições diferentes, linhas em branco no meio), então o cabeçalho é
+    localizado dinamicamente pela célula "MATRÍCULA" em vez de por posição
+    fixa. Falha de rede ou planilha não configurada não é fatal aqui: devolve
+    o que conseguiu (vazio, na pior das hipóteses).
+    """
+    import google_sheets as gs
+
+    try:
+        config = gs._carregar_config()
+    except Exception as e:
+        print(f"  Aviso: não foi possível carregar config_sheets.yaml: {e}")
+        return {}
+
+    spreadsheet_id = spreadsheet_id or config.get("bolsistas", {}).get("spreadsheet_id", "").strip()
+    if not spreadsheet_id:
+        return {}
+
+    try:
+        cliente = gs._obter_cliente(config)
+        planilha = gs._com_retry(lambda: cliente.open_by_key(spreadsheet_id))
+        abas = gs._com_retry(planilha.worksheets)
+    except Exception as e:
+        print(f"  Aviso: não foi possível abrir a planilha de bolsistas: {e}")
+        return {}
+
+    cadastro = {}
+    for aba in abas:
+        if _normalizar_texto(aba.title) not in _ABAS_BOLSISTAS:
+            continue
+        try:
+            valores = gs._com_retry(aba.get_all_values)
+        except Exception as e:
+            print(f"  Aviso: não foi possível ler a aba '{aba.title}' de bolsistas: {e}")
+            continue
+
+        col_nome = col_mat = None
+        for linha in valores[:10]:
+            rotulos = [_normalizar_texto(c) for c in linha]
+            if "matricula" in rotulos:
+                col_nome = rotulos.index("nome") if "nome" in rotulos else None
+                col_mat = rotulos.index("matricula")
+                break
+        if col_mat is None or col_nome is None:
+            print(f"  Aviso: cabeçalho não encontrado na aba '{aba.title}' de bolsistas.")
+            continue
+
+        for linha in valores:
+            nome = linha[col_nome].strip() if col_nome < len(linha) else ""
+            mat = lote_mod.norm_mat(linha[col_mat]) if col_mat < len(linha) else ""
+            if nome and len(mat) >= 6:
+                cadastro.setdefault(mat, nome)
+
+    return cadastro
+
+
+def cadastro_combinado(caminho_xlsx=None, usar_sheets=True, usar_bolsistas=True) -> dict:
+    """
+    Junta a planilha de impressão, o histórico do Sheets e a base de bolsistas.
 
     A planilha atual tem os nomes como estão hoje; o Sheets tem quem já saiu.
     Na dúvida entre as duas grafias de um mesmo nome, a planilha vence, porque
-    é a fonte que gera as impressões.
+    é a fonte que gera as impressões. A base de bolsistas entra por último e
+    só preenche matrículas que as outras duas não conhecem — é fonte de
+    verificação adicional (fallback), não deve sobrepor um nome já resolvido.
     """
     cadastro = {}
     if usar_sheets:
         cadastro.update(carregar_cadastro_sheets())
     if caminho_xlsx and os.path.isfile(caminho_xlsx):
         cadastro.update(carregar_cadastro(caminho_xlsx))
+    if usar_bolsistas:
+        for mat, nome in carregar_cadastro_bolsistas().items():
+            cadastro.setdefault(mat, nome)
     return cadastro
 
 
@@ -768,7 +962,9 @@ def main():
     elif caminhos_scan:
         print("Montando o cadastro mestre...")
         cadastro = cadastro_combinado(
-            _arg("--cadastro"), usar_sheets="--sem-sheets" not in sys.argv
+            _arg("--cadastro"),
+            usar_sheets="--sem-sheets" not in sys.argv,
+            usar_bolsistas="--sem-bolsistas" not in sys.argv,
         )
         if cadastro:
             print(f"Cadastro mestre: {len(cadastro)} matrículas")
@@ -780,7 +976,7 @@ def main():
         fonte = ", ".join(os.path.basename(c) for c in caminhos_scan)
         c = dados["confianca"]
         print(f"OCR: {c['exatas']} exatas, {c['corrigidas']} corrigidas, "
-              f"{c['sem_match']} sem correspondência")
+              f"{c['por_nome']} por nome, {c['sem_match']} sem correspondência")
     else:
         dados = extrair_da_planilha(caminho_planilha, _arg("--aba") or aba, config)
         origem = lote_mod.ORIGEM_XLSX

@@ -31,6 +31,15 @@ restaurantes:
 
 dashboard_spreadsheet_id: "1d4SfVWnG8iwk90jGnPIj7U6bPG5nriA5F2b-6pvSt60"
 
+# Base de bolsistas do RU (cadastro oficial, mantido por fora deste sistema).
+# Usada só como fonte adicional de fallback quando uma matrícula lida por OCR
+# não bate com o cadastro mestre (planilha de impressão + histórico do
+# Sheets) — ver recuperar_lote.carregar_cadastro_bolsistas. Considera só as
+# abas ONDINA, CANELA e SÃO LÁZARO da planilha (as demais não são cadastro
+# de bolsista).
+bolsistas:
+  spreadsheet_id: "1VjnEshyExQtgks7b3tc216b8DjBGyS4u9PEW2zVjPRM"
+
 # Sincronização de lotes entre máquinas (ver SINCRONIZACAO_LOTES.md)
 #
 # O lote (roster + geometria congelados no momento da impressão) nasce só na

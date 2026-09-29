@@ -160,7 +160,11 @@ def _detectar_numero_pagina(alinhada: np.ndarray, config: dict):
     except Exception:
         return None
 
-    m = _re.search(r"[Pp][aá]gina\s+(\d+)\s+de\b", text, _re.IGNORECASE)
+    # O Tesseract costuma grudar "de" no número vizinho sem espaço em pelo
+    # menos um dos lados ("Página 6 de6", "Página 5de6") — por isso os dois
+    # `\s*` são opcionais, não `\s+`. Exigir espaço aqui fazia a regex nunca
+    # casar e todas as páginas do maço saírem como não lidas.
+    m = _re.search(r"[Pp][aá]gina\s+(\d+)\s*de", text, _re.IGNORECASE)
     if m:
         return int(m.group(1))
 

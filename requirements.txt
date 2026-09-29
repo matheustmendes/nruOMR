@@ -10,3 +10,4 @@ pytest
 gspread
 google-auth
 pypdf
+pytesseract

@@ -47,6 +47,8 @@ from gerar_template import (
 from google_sheets import exportar_para_sheets
 import lote as lote_mod
 import corrigir_passivo
+from reconciliar import releitura_correta
+from fundir_duplicados import unir_contagens
 
 
 app = Flask(__name__)
@@ -613,6 +615,186 @@ def rota_sheets_exportar():
         else:
             return jsonify({"erro": resultado.get("erro", "Erro desconhecido")}), 500
 
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"erro": str(e)}), 500
+
+
+def _salvar_grupo_scan(files):
+    """Salva os arquivos enviados e mescla em um único PDF, se for mais de um."""
+    tmps = []
+    for f in files:
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.close()
+        f.save(tmp.name)
+        tmps.append(tmp.name)
+    if len(tmps) == 1:
+        return tmps[0], []
+    mesclado = _mesclar_pdfs(tmps)
+    return mesclado, tmps
+
+
+@app.route("/processar_duplicado", methods=["POST"])
+def rota_processar_duplicado():
+    """
+    Une duas listas escaneadas do MESMO lote/período que a empresa devolveu
+    com presenças diferentes entre uma e outra.
+
+    Casa as duas por número de linha (mesmo lote = mesma ordem impressa) e
+    marca presença quando QUALQUER uma das duas tiver marcado aquele dia —
+    perder uma presença legítima pesa mais contra o bolsista do que sobrar
+    uma marca a mais. Não escreve no Sheets se a ordem das páginas de
+    alguma das duas listas não puder ser confirmada (ver `releitura_correta`).
+    """
+    caminhos_para_apagar = []
+    try:
+        restaurante_key = request.form.get("restaurante")
+        if restaurante_key not in RESTAURANTES:
+            return jsonify({"erro": "Restaurante inválido"}), 400
+
+        lote_id = (request.form.get("lote_id") or "").strip()
+        periodo_semana = request.form.get("periodo_semana", "").strip()
+        if not lote_id:
+            return jsonify({"erro": "Selecione o lote impresso das duas listas."}), 400
+        if not periodo_semana:
+            return jsonify({"erro": "Informe o período da semana (ex: 05/05 a 09/05)"}), 400
+
+        scans_a = request.files.getlist("scan_a")
+        scans_b = request.files.getlist("scan_b")
+        if not scans_a or not scans_a[0].filename:
+            return jsonify({"erro": "Envie o(s) PDF(s) da lista A"}), 400
+        if not scans_b or not scans_b[0].filename:
+            return jsonify({"erro": "Envie o(s) PDF(s) da lista B"}), 400
+
+        try:
+            pagina_inicial_a = max(1, int(request.form.get("pagina_inicial_a", "").strip() or 1))
+        except ValueError:
+            pagina_inicial_a = 1
+        try:
+            pagina_inicial_b = max(1, int(request.form.get("pagina_inicial_b", "").strip() or 1))
+        except ValueError:
+            pagina_inicial_b = 1
+
+        try:
+            lote = lote_mod.carregar_lote(lote_id)
+        except FileNotFoundError as e:
+            return jsonify({"erro": str(e)}), 400
+
+        if lote["restaurante_key"] != restaurante_key:
+            return jsonify({
+                "erro": f"O lote {lote_id} é de {lote['restaurante_nome']}, "
+                        f"não de {RESTAURANTES[restaurante_key]['nome']}."
+            }), 400
+
+        caminho_a, partes_a = _salvar_grupo_scan(scans_a)
+        caminho_b, partes_b = _salvar_grupo_scan(scans_b)
+        caminhos_para_apagar = [caminho_a, caminho_b] + partes_a + partes_b
+
+        contagem_a, roster, dias, resumo_a = releitura_correta(lote, [caminho_a], pagina_inicial_a)
+        contagem_b, _roster_b, _dias_b, resumo_b = releitura_correta(lote, [caminho_b], pagina_inicial_b)
+
+        avisos = []
+        if lote["origem"] == lote_mod.ORIGEM_OCR:
+            avisos.append(
+                f"O lote {lote_id} foi reconstruído por OCR. Confira as linhas "
+                f"'sem_match' no JSON do lote antes de confiar na identidade."
+            )
+        for nome_grupo, resumo in (("A", resumo_a), ("B", resumo_b)):
+            if resumo["excedentes_com_marca"]:
+                avisos.append(
+                    f"Lista {nome_grupo}: {len(resumo['excedentes_com_marca'])} linha(s) "
+                    f"fora do lote com marcação real — descartadas da união."
+                )
+
+        if not (resumo_a["ordem_confiavel"] and resumo_b["ordem_confiavel"]):
+            motivo = resumo_a.get("motivo_ordem") or resumo_b.get("motivo_ordem") or ""
+            return jsonify({
+                "erro": (
+                    "Ordem das páginas não confirmada em pelo menos uma das duas "
+                    "listas — unir aqui arrisca trocar a presença de uma pessoa "
+                    "pela de outra. Ajuste o conjunto de arquivos (remova "
+                    "redigitalizações sobrepostas) e tente de novo. " + motivo
+                ),
+            }), 400
+
+        unida, diferencas = unir_contagens(contagem_a, contagem_b, dias)
+
+        diferencas_resp = []
+        for d in diferencas:
+            idx = d["numero"] - 1
+            nome = roster[idx][0] if 0 <= idx < len(roster) else f"linha {d['numero']}"
+            diferencas_resp.append(dict(d, nome=nome))
+
+        cobertura_total = len(unida) >= lote["total_alunos"]
+        resultado_sheets = exportar_para_sheets(
+            unida, roster, dias, restaurante_key, periodo_semana,
+            limpar_ausentes=cobertura_total,
+        )
+
+        if resultado_sheets.get("ok"):
+            sheets_resp = {"sheets_status": "ok", "sheets_aba": resultado_sheets.get("aba", "")}
+            aviso = resultado_sheets.get("aviso_ordem") or resultado_sheets.get("aviso_formatacao")
+            if aviso:
+                sheets_resp["sheets_aviso"] = aviso
+        elif resultado_sheets.get("duplicado"):
+            sheets_resp = {"sheets_status": "duplicado", "sheets_aba": resultado_sheets.get("aba", "")}
+        else:
+            sheets_resp = {"sheets_status": "erro", "sheets_erro": resultado_sheets.get("erro", "")}
+
+        app.config["ULTIMO_UNIAO"] = {
+            "contagem": unida, "roster": roster, "dias": dias,
+            "restaurante_key": restaurante_key, "periodo": periodo_semana,
+            "lote_id": lote_id, "cobertura_total": cobertura_total,
+        }
+
+        lote_mod.registrar_processamento(
+            lote_id, periodo_semana,
+            sincronizado_sheets=bool(resultado_sheets.get("ok")),
+            detalhe=f"união de listas duplicadas: {len(diferencas)} linha(s) resolvidas",
+        )
+
+        return jsonify({
+            "sucesso": True,
+            "alunos": len(unida),
+            "linhas_a": resumo_a["linhas_lidas"],
+            "linhas_b": resumo_b["linhas_lidas"],
+            "diferencas": diferencas_resp,
+            "avisos": avisos,
+            **sheets_resp,
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"erro": str(e)}), 500
+
+    finally:
+        for caminho in caminhos_para_apagar:
+            try:
+                os.unlink(caminho)
+            except Exception:
+                pass
+
+
+@app.route("/sheets_exportar_duplicado", methods=["POST"])
+def rota_sheets_exportar_duplicado():
+    dados = app.config.get("ULTIMO_UNIAO")
+    if not dados:
+        return jsonify({"erro": "Nenhuma união em memória. Processe as duas listas de novo."}), 400
+    try:
+        resultado = exportar_para_sheets(
+            dados["contagem"], dados["roster"], dados["dias"],
+            dados["restaurante_key"], dados["periodo"], forcar=True,
+            limpar_ausentes=dados["cobertura_total"],
+        )
+        if dados.get("lote_id"):
+            lote_mod.registrar_processamento(
+                dados["lote_id"], dados["periodo"],
+                sincronizado_sheets=bool(resultado.get("ok")),
+                detalhe="união de listas duplicadas (forçado)",
+            )
+        if resultado.get("ok"):
+            return jsonify({"sucesso": True, "aba": resultado.get("aba", "")})
+        return jsonify({"erro": resultado.get("erro", "Erro desconhecido")}), 500
     except Exception as e:
         traceback.print_exc()
         return jsonify({"erro": str(e)}), 500
@@ -1256,6 +1438,7 @@ body {
         <button class="tab" onclick="switchTab('processar', this)">Processar scan</button>
         <button class="tab" onclick="switchTab('recuperar', this)">Recuperar lote</button>
         <button class="tab" onclick="switchTab('limpar', this)">Limpar lotes antigos</button>
+        <button class="tab" onclick="switchTab('duplicado', this); carregarLotesDup();">Unir listas duplicadas</button>
     </div>
 
     <!-- ABA: GERAR TEMPLATE -->
@@ -1612,6 +1795,112 @@ body {
 
         <div id="result-limpar"></div>
     </div>
+
+    <div class="panel" id="panel-duplicado">
+        <div style="font-size:12px;color:#999;margin-bottom:14px;">
+            Quando a empresa devolve duas listas escaneadas do <strong>mesmo lote e
+            período</strong> com presenças diferentes entre uma e outra, use esta aba
+            pra unir as duas: cada dia marcado como presença em QUALQUER uma das
+            duas conta como presença no resultado final. As duas listas precisam
+            ser do mesmo lote impresso — é a ordem das linhas dele que casa quem é
+            quem entre A e B.
+        </div>
+
+        <form id="form-duplicado" onsubmit="return submitDuplicado(event)">
+            <div class="section">
+                <div class="label">Restaurante</div>
+                <div class="radio-group">
+                    <label class="radio selected" onclick="selectRadio(this, 'rest-duplicado')">
+                        <input type="radio" name="rest-duplicado" value="canela" checked> Canela
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-duplicado')">
+                        <input type="radio" name="rest-duplicado" value="ondina"> Ondina
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-duplicado')">
+                        <input type="radio" name="rest-duplicado" value="sao_lazaro"> São Lázaro
+                    </label>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="label">Lote impresso <span style="font-weight:400;color:#aaa">(o mesmo para as duas listas)</span></div>
+                <select id="select-lote-dup" onchange="onLoteDupChange()"
+                        style="width:100%;max-width:420px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;box-sizing:border-box;">
+                    <option value="">Carregando lotes...</option>
+                </select>
+                <div id="lote-dup-detalhe" style="font-size:12px;color:#888;margin-top:6px;"></div>
+            </div>
+
+            <div class="section">
+                <div class="label">Lista A (.pdf) <span style="font-weight:400;color:#aaa">(pode selecionar vários PDFs — mesclados nessa ordem)</span></div>
+                <div id="zone-duplicado-a" class="upload-zone">
+                    <input type="file" accept=".pdf" multiple onchange="onBucketSelected(this, 'duplicado-a')">
+                    <div class="upload-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
+                    </div>
+                    <div class="upload-text" id="texto-duplicado-a">Arraste o(s) PDF(s) ou clique para selecionar</div>
+                    <div class="upload-hint">.pdf escaneado da lista A</div>
+                </div>
+                <div id="info-duplicado-a" style="font-size:12px;color:#666;margin-top:6px;"></div>
+                <div class="label" style="margin-top:10px;">Página inicial da lista A <span style="font-weight:400;color:#aaa">(só se não começar na página 1 do lote)</span></div>
+                <input type="number" id="pagina-inicial-a-dup" min="1" value="1" placeholder="1"
+                       style="width:100px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
+            </div>
+
+            <div class="section">
+                <div class="label">Lista B (.pdf) <span style="font-weight:400;color:#aaa">(pode selecionar vários PDFs — mesclados nessa ordem)</span></div>
+                <div id="zone-duplicado-b" class="upload-zone">
+                    <input type="file" accept=".pdf" multiple onchange="onBucketSelected(this, 'duplicado-b')">
+                    <div class="upload-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
+                    </div>
+                    <div class="upload-text" id="texto-duplicado-b">Arraste o(s) PDF(s) ou clique para selecionar</div>
+                    <div class="upload-hint">.pdf escaneado da lista B</div>
+                </div>
+                <div id="info-duplicado-b" style="font-size:12px;color:#666;margin-top:6px;"></div>
+                <div class="label" style="margin-top:10px;">Página inicial da lista B <span style="font-weight:400;color:#aaa">(só se não começar na página 1 do lote)</span></div>
+                <input type="number" id="pagina-inicial-b-dup" min="1" value="1" placeholder="1"
+                       style="width:100px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
+            </div>
+
+            <div class="section">
+                <div class="label">Período da semana <span style="font-weight:400;color:#aaa">(ex: 05/05 a 09/05)</span></div>
+                <input type="text" id="periodo-semana-dup" placeholder="05/05 a 09/05"
+                       style="width:200px;padding:8px 12px;border-radius:8px;border:1px solid #e5e5e3;font-size:14px;font-family:inherit;">
+            </div>
+
+            <button type="submit" class="btn" id="btn-duplicado">Unir as duas listas</button>
+        </form>
+
+        <div class="loading" id="loading-duplicado">
+            <div class="spinner"></div>
+            Lendo as duas listas e unindo... isso pode levar alguns minutos.
+        </div>
+
+        <div class="error-msg" id="error-duplicado"></div>
+
+        <div class="result" id="result-duplicado">
+            <div class="result-row">
+                <span class="result-label">Pessoas na união</span>
+                <span class="result-value" id="rd-alunos"></span>
+            </div>
+            <div class="result-row">
+                <span class="result-label">Linhas lidas (A / B)</span>
+                <span class="result-value" id="rd-linhas"></span>
+            </div>
+            <div class="result-row">
+                <span class="result-label">Diferenças resolvidas por união</span>
+                <span class="result-value" id="rd-diferencas"></span>
+            </div>
+            <div class="result-row" id="sheets-row-dup" style="display:none;">
+                <span class="result-label">Google Sheets</span>
+                <span class="result-value" id="sheets-msg-dup"></span>
+            </div>
+            <div id="avisos-box-dup" style="display:none;margin-top:10px;"></div>
+            <button type="button" class="btn-substituir" id="btn-substituir-dup" style="display:none;" onclick="substituirSemanaDup()">Substituir semana no Google Sheets</button>
+            <div id="diferencas-tabela-dup" style="margin-top:12px;"></div>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -1640,6 +1929,10 @@ function selectRadio(el, name) {
     if (name === 'rest-processar') {
         carregarLotes();
     }
+
+    if (name === 'rest-duplicado') {
+        carregarLotesDup();
+    }
 }
 
 function toggleDiaEspecial(el) {
@@ -1647,7 +1940,10 @@ function toggleDiaEspecial(el) {
 }
 
 // --- Zonas de upload de vários PDFs de uma vez (sem ordem/mesclagem) ---
-var uploadBuckets = { 'recuperar-scans': [], 'recuperar-templates': [] };
+var uploadBuckets = {
+    'recuperar-scans': [], 'recuperar-templates': [],
+    'duplicado-a': [], 'duplicado-b': [],
+};
 
 function onBucketSelected(input, bucket) {
     adicionarNoBucket(bucket, input.files);
@@ -2574,6 +2870,191 @@ function substituirSemana() {
                 if (data.sheets_aviso_matricula) {
                     mostrarAvisos([data.sheets_aviso_matricula]);
                 }
+            }
+        })
+        .catch(function() {
+            btn.disabled = false;
+            btn.textContent = 'Substituir semana no Google Sheets';
+        });
+}
+
+// --- Unir listas duplicadas ---------------------------------------------
+
+var lotesCarregadosDup = [];
+
+function carregarLotesDup() {
+    var sel = document.getElementById('select-lote-dup');
+    if (!sel) return;
+    var restaurante = document.querySelector('input[name="rest-duplicado"]:checked').value;
+    sel.innerHTML = '<option value="">Carregando lotes...</option>';
+    document.getElementById('lote-dup-detalhe').textContent = '';
+
+    fetch('/lotes?restaurante=' + encodeURIComponent(restaurante) + '&limite=200')
+        .then(r => r.json())
+        .then(data => {
+            lotesCarregadosDup = dedupPorLoteId(data.lotes || []);
+            if (!lotesCarregadosDup.length) {
+                sel.innerHTML = '<option value="">Nenhum lote encontrado para este restaurante</option>';
+                return;
+            }
+            var html = '<option value="">Selecione o lote...</option>';
+            lotesCarregadosDup.forEach(function(l) {
+                var rotulo = (l.datas || l.mes_ano || l.lote_id) +
+                    '  —  ' + l.total_alunos + ' pessoa(s)' +
+                    (l.origem && l.origem !== 'geracao' ? '  (recuperado)' : '');
+                html += '<option value="' + l.lote_id + '">' + rotulo + '</option>';
+            });
+            sel.innerHTML = html;
+        })
+        .catch(function() {
+            sel.innerHTML = '<option value="">Erro ao listar lotes</option>';
+        });
+}
+
+function onLoteDupChange() {
+    var id = document.getElementById('select-lote-dup').value;
+    var det = document.getElementById('lote-dup-detalhe');
+    var l = lotesCarregadosDup.filter(function(x) { return x.lote_id === id; })[0];
+    if (!l) { det.textContent = ''; return; }
+    var txt = l.total_alunos + ' pessoa(s), ' + (l.total_paginas || '?') + ' página(s)';
+    if (l.origem && l.origem !== 'geracao') {
+        txt += ' — lote recuperado (' + l.origem + '), confira a identidade antes de confiar';
+    }
+    det.textContent = txt;
+}
+
+function mostrarAvisosDup(avisos) {
+    var box = document.getElementById('avisos-box-dup');
+    if (!avisos || !avisos.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    var html = '';
+    avisos.forEach(function(a) {
+        html += '<div style="background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;' +
+                'padding:9px 12px;font-size:12px;color:#7a5a10;margin-top:6px;">' + a + '</div>';
+    });
+    box.innerHTML = html;
+    box.style.display = '';
+}
+
+function renderDiferencasDup(diferencas) {
+    var box = document.getElementById('diferencas-tabela-dup');
+    if (!diferencas || !diferencas.length) { box.innerHTML = ''; return; }
+    var html = '<div style="font-size:12px;color:#666;margin-bottom:6px;">' +
+        'Diferenças resolvidas por união (A → B → total unido):</div>' +
+        '<div style="max-height:260px;overflow:auto;border:1px solid #eee;border-radius:8px;">' +
+        '<table style="width:100%;border-collapse:collapse;font-size:12.5px;">' +
+        '<thead><tr style="background:#fafafa;text-align:left;">' +
+        '<th style="padding:6px 10px;">Nº</th><th style="padding:6px 10px;">Nome</th>' +
+        '<th style="padding:6px 10px;">A</th><th style="padding:6px 10px;">B</th>' +
+        '<th style="padding:6px 10px;">União</th></tr></thead><tbody>';
+    diferencas.forEach(function(d) {
+        html += '<tr style="border-top:1px solid #f0f0f0;">' +
+            '<td style="padding:6px 10px;">' + d.numero + '</td>' +
+            '<td style="padding:6px 10px;">' + (d.nome || '') + '</td>' +
+            '<td style="padding:6px 10px;">' + d.presencas_a + '</td>' +
+            '<td style="padding:6px 10px;">' + d.presencas_b + '</td>' +
+            '<td style="padding:6px 10px;font-weight:600;">' + d.presencas_unida + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+    box.innerHTML = html;
+}
+
+function submitDuplicado(e) {
+    e.preventDefault();
+
+    var restaurante = document.querySelector('input[name="rest-duplicado"]:checked').value;
+    var loteId = document.getElementById('select-lote-dup').value;
+    var periodo = document.getElementById('periodo-semana-dup').value.trim();
+    var paginaA = document.getElementById('pagina-inicial-a-dup').value.trim();
+    var paginaB = document.getElementById('pagina-inicial-b-dup').value.trim();
+    var filesA = uploadBuckets['duplicado-a'];
+    var filesB = uploadBuckets['duplicado-b'];
+
+    if (!loteId) { showError('duplicado', 'Selecione o lote impresso das duas listas.'); return false; }
+    if (!filesA.length) { showError('duplicado', 'Envie o(s) PDF(s) da lista A.'); return false; }
+    if (!filesB.length) { showError('duplicado', 'Envie o(s) PDF(s) da lista B.'); return false; }
+    if (!periodo) { showError('duplicado', 'Informe o período da semana (ex: 05/05 a 09/05).'); return false; }
+
+    var data = new FormData();
+    data.set('restaurante', restaurante);
+    data.set('lote_id', loteId);
+    data.set('periodo_semana', periodo);
+    data.set('pagina_inicial_a', paginaA || '1');
+    data.set('pagina_inicial_b', paginaB || '1');
+    filesA.forEach(function(f) { data.append('scan_a', f); });
+    filesB.forEach(function(f) { data.append('scan_b', f); });
+
+    showLoading('duplicado', true);
+    hideError('duplicado');
+    document.getElementById('result-duplicado').classList.remove('show');
+
+    fetch('/processar_duplicado', { method: 'POST', body: data })
+        .then(r => r.json())
+        .then(data => {
+            showLoading('duplicado', false);
+            if (data.erro) {
+                showError('duplicado', data.erro);
+                return;
+            }
+
+            document.getElementById('rd-alunos').textContent = data.alunos;
+            document.getElementById('rd-linhas').textContent = data.linhas_a + ' / ' + data.linhas_b;
+            document.getElementById('rd-diferencas').textContent = data.diferencas.length;
+            document.getElementById('rd-diferencas').className =
+                'result-value ' + (data.diferencas.length > 0 ? 'result-warn' : 'result-ok');
+
+            renderDiferencasDup(data.diferencas);
+            mostrarAvisosDup(data.avisos);
+
+            var sheetsRow = document.getElementById('sheets-row-dup');
+            var sheetsMsg = document.getElementById('sheets-msg-dup');
+            var btnSubst = document.getElementById('btn-substituir-dup');
+            btnSubst.style.display = 'none';
+
+            if (data.sheets_status === 'ok') {
+                sheetsRow.style.display = '';
+                sheetsMsg.textContent = '✓ Exportado (' + data.sheets_aba + ')';
+                sheetsMsg.className = 'result-value result-ok';
+            } else if (data.sheets_status === 'duplicado') {
+                sheetsRow.style.display = '';
+                sheetsMsg.textContent = 'Semana já existe em ' + data.sheets_aba;
+                sheetsMsg.className = 'result-value result-warn';
+                btnSubst.style.display = '';
+                btnSubst.disabled = false;
+                btnSubst.textContent = 'Substituir semana no Google Sheets';
+            } else if (data.sheets_status === 'erro') {
+                sheetsRow.style.display = '';
+                sheetsMsg.textContent = 'Erro no Sheets: ' + (data.sheets_erro || 'falha desconhecida');
+                sheetsMsg.className = 'result-value result-warn';
+            } else {
+                sheetsRow.style.display = 'none';
+            }
+
+            document.getElementById('result-duplicado').classList.add('show');
+        })
+        .catch(err => {
+            showLoading('duplicado', false);
+            showError('duplicado', 'Erro de conexão: ' + err.message);
+        });
+
+    return false;
+}
+
+function substituirSemanaDup() {
+    var btn = document.getElementById('btn-substituir-dup');
+    btn.disabled = true;
+    btn.textContent = 'Substituindo...';
+
+    fetch('/sheets_exportar_duplicado', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var msg = document.getElementById('sheets-msg-dup');
+            btn.style.display = 'none';
+            if (data.erro) {
+                msg.textContent = 'Erro no Sheets: ' + data.erro;
+                msg.className = 'result-value result-warn';
+            } else {
+                msg.textContent = '✓ Exportado (' + (data.aba || '') + ')';
+                msg.className = 'result-value result-ok';
             }
         })
         .catch(function() {

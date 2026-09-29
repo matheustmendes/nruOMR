@@ -28,12 +28,13 @@ def _grade(linhas_alunos, dias=DIAS, periodo="12/05 a 16/05"):
 
     linhas_alunos: [(nome, matricula, presencas, {dia: marca})]
     """
-    cabecalho_periodo = ["", "", "", gs._PREFIXO_PERIODO + periodo] + [""] * len(dias)
-    cabecalho_colunas = ["Nº", "Nome", "Matrícula", "Presenças"] + list(dias)
+    cabecalho_periodo = ([""] * gs._COL_FIXAS + [gs._PREFIXO_PERIODO + periodo]
+                          + [""] * len(dias))
+    cabecalho_colunas = list(gs._CABECALHO_FIXO) + ["Presenças"] + list(dias)
 
     grade = [cabecalho_periodo, cabecalho_colunas]
     for i, (nome, mat, presencas, marcas) in enumerate(linhas_alunos, start=1):
-        grade.append([str(i), nome, mat, str(presencas)] +
+        grade.append([str(i), nome, mat, "", "", str(presencas)] +
                      [marcas.get(d, "") for d in dias])
     return grade
 
@@ -130,11 +131,25 @@ class TestLerGrupos:
 
         assert grupo["periodo"] == "12/05 a 16/05"
         assert grupo["dias"] == DIAS
-        assert grupo["col"] == 3
+        assert grupo["col"] == gs._COL_FIXAS
         assert grupo["largura"] == 3
 
     def test_grade_vazia_nao_quebra(self):
         assert gs._ler_grupos([]) == []
+
+
+class TestColunasFixasExtras:
+
+    def test_cabecalho_inclui_presencas_mes_e_justificativa(self):
+        assert gs._CABECALHO_FIXO == [
+            "Nº", "Nome", "Matrícula", "Presenças no Mês", "Justificou Ausência?",
+        ]
+
+    def test_formula_presencas_mes_soma_a_partir_da_1a_coluna_de_periodo(self):
+        # Separador ";" — a planilha é pt_BR, "," dá "Formula parse error."
+        assert gs._formula_presencas_mes(7) == (
+            '=SUMIF(F2:2;"Presenças";F7:7)'
+        )
 
 
 class TestDetectarMatriculasDuplicadas:

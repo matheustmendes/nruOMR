@@ -59,10 +59,52 @@ _BRANCO        = {"red": 1.0,  "green": 1.0,  "blue": 1.0}
 
 # --- Geometria do layout horizontal ---
 _PREFIXO_PERIODO = "Período: "
-_COL_FIXAS       = 3   # Nº, Nome, Matrícula
+_COL_FIXAS       = 5   # Nº, Nome, Matrícula, Presenças no Mês, Justificou Ausência?
 _LINHA_PERIODO   = 1   # 1-indexed
 _LINHA_CABECALHO = 2
 _LINHA_DADOS     = 3   # primeira linha de aluno
+
+_CABECALHO_FIXO = [
+    "Nº", "Nome", "Matrícula", "Presenças no Mês", "Justificou Ausência?",
+]
+
+# Dropdown da coluna "Justificou Ausência?" — vazio = nada a justificar ainda.
+_OPCOES_JUSTIFICATIVA = ["Sim", "Não"]
+
+
+def _col_letra(indice_0idx):
+    """Converte índice de coluna 0-based para letra A1 (A, B, ..., Z, AA, ...)."""
+    n = indice_0idx + 1
+    letras = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        letras = chr(65 + r) + letras
+    return letras
+
+
+_COL_PERIODOS_LETRA = _col_letra(_COL_FIXAS)  # primeira coluna depois das fixas
+
+
+def _formula_presencas_mes(linha):
+    """
+    Formula da coluna "Presenças no Mês": soma todas as colunas "Presenças"
+    (uma por grupo de período) daquela linha.
+
+    Usa a linha inteira (a partir da primeira coluna de período) como
+    critério/soma em vez de colunas fixas porque o número de períodos e a
+    posição de cada grupo mudam a cada semana nova inserida — a fórmula não
+    pode depender disso para continuar somando certo. Não pode incluir as
+    colunas fixas no intervalo: isso incluiria a própria célula da fórmula e
+    o Sheets recusa como referência circular.
+
+    Separador de argumento é ";" (não ","): as planilhas são pt_BR, e nesse
+    locale o Sheets exige ";" — "," daria "Formula parse error.".
+    """
+    c = _COL_PERIODOS_LETRA
+    return (
+        f'=SUMIF({c}{_LINHA_CABECALHO}:{_LINHA_CABECALHO};'
+        f'"Presenças";{c}{linha}:{linha})'
+    )
 
 _DIA_SEMANA_PT = {
     "Segunda": 0,
@@ -563,8 +605,8 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
             "values": [[_marcador_periodo(periodo)]],
         },
         {
-            "range":  f"A{_LINHA_CABECALHO}:C{_LINHA_CABECALHO}",
-            "values": [["Nº", "Nome", "Matrícula"]],
+            "range":  f"A{_LINHA_CABECALHO}:E{_LINHA_CABECALHO}",
+            "values": [_CABECALHO_FIXO],
         },
         {
             "range": (
@@ -577,8 +619,11 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
 
     if novos:
         updates.append({
-            "range":  f"A{novos[0]['linha']}:C{linha_fim}",
-            "values": [[n["num"], n["nome"], n["mat"]] for n in novos],
+            "range":  f"A{novos[0]['linha']}:E{linha_fim}",
+            "values": [
+                [n["num"], n["nome"], n["mat"], _formula_presencas_mes(n["linha"]), ""]
+                for n in novos
+            ],
         })
 
     if matriz:
@@ -596,7 +641,7 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
 # --- Formatação ------------------------------------------------------------
 
 def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
-    """Congela linhas 1–2 / colunas A–C e formata o cabeçalho fixo."""
+    """Congela linhas 1–2 / colunas A–E e formata o cabeçalho fixo."""
     sheet_id = aba.id
     borda = {"style": "SOLID", "width": 1, "color": _COR_BORDA}
 
@@ -695,8 +740,27 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
                 "properties": {"pixelSize": px}, "fields": "pixelSize",
             }
         }
-        for col, px in [(0, 45), (1, 250), (2, 110)]
+        for col, px in [(0, 45), (1, 250), (2, 110), (3, 130), (4, 150)]
     ]
+
+    # Dropdown "Justificou Ausência?" — vazio continua permitido (nada a
+    # justificar ainda), só restringe o que pode ser digitado quando preenchido.
+    if linha_fim >= _LINHA_DADOS:
+        requests.append({
+            "setDataValidation": {
+                "range": rng(_LINHA_DADOS - 1, linha_fim, c0=4, c1=5),
+                "rule": {
+                    "condition": {
+                        "type": "ONE_OF_LIST",
+                        "values": [
+                            {"userEnteredValue": v} for v in _OPCOES_JUSTIFICATIVA
+                        ],
+                    },
+                    "showCustomUi": True,
+                    "strict": True,
+                },
+            }
+        })
 
     spreadsheet.batch_update({"requests": requests})
 
@@ -1196,6 +1260,114 @@ def diagnosticar_aba(restaurante_key, nome_aba):
         "duplicadas": duplicadas,
         "periodos": periodos,
     }
+
+
+# --- MIGRAÇÃO: colunas "Presenças no Mês" e "Justificou Ausência?" ---------
+#
+# `exportar_para_sheets` já grava essas duas colunas em toda aba nova (e em
+# todo aluno novo de uma aba já migrada) desde que `_COL_FIXAS` passou a
+# valer 5. Mas abas mensais que já existiam antes disso ainda têm só 3
+# colunas fixas — esta migração insere as 2 colunas que faltam nelas, uma vez,
+# sem tocar nos dados de presença já lançados.
+
+def migrar_colunas_extras(restaurante_key, nomes_abas=None, dry_run=False):
+    """
+    Insere as colunas "Presenças no Mês" (fórmula) e "Justificou Ausência?"
+    (dropdown Sim/Não) nas abas mensais de um restaurante que ainda estão no
+    layout de 3 colunas fixas.
+
+    Idempotente: uma aba que já tem o cabeçalho novo em D2 é pulada, então
+    rodar de novo não duplica nada.
+
+    Args:
+        restaurante_key: "canela" | "ondina" | "sao_lazaro"
+        nomes_abas: nomes de aba a considerar; None = todas as abas da planilha
+        dry_run: se True, só relata o que faria, sem gravar nada
+
+    Returns:
+        [{"aba", "status": "migrada"|"pulada"|"seria migrada"|"erro", ...}]
+    """
+    config = _carregar_config()
+    rest = config.get("restaurantes", {}).get(restaurante_key, {})
+    spreadsheet_id = rest.get("spreadsheet_id", "").strip()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            f"spreadsheet_id não configurado para '{restaurante_key}' "
+            "em config_sheets.yaml"
+        )
+
+    cliente = _obter_cliente(config)
+    spreadsheet = cliente.open_by_key(spreadsheet_id)
+
+    abas = _com_retry(spreadsheet.worksheets)
+    if nomes_abas is not None:
+        nomes = set(nomes_abas)
+        abas = [a for a in abas if a.title in nomes]
+
+    resultados = []
+    for aba in abas:
+        try:
+            resultados.append(_migrar_aba_colunas_extras(spreadsheet, aba, dry_run))
+        except Exception as e:
+            resultados.append({"aba": aba.title, "status": "erro", "erro": str(e)})
+    return resultados
+
+
+def _migrar_aba_colunas_extras(spreadsheet, aba, dry_run):
+    valores = _com_retry(aba.get_all_values)
+    if not valores:
+        return {"aba": aba.title, "status": "pulada", "motivo": "aba vazia"}
+
+    row1 = valores[0]
+    row2 = valores[1] if len(valores) > 1 else []
+
+    tem_periodo = any(
+        str(v).strip().startswith(_PREFIXO_PERIODO) for v in row1
+    )
+    if not tem_periodo:
+        return {
+            "aba": aba.title, "status": "pulada",
+            "motivo": "não é layout horizontal (sem marcador de período)",
+        }
+
+    d2 = str(row2[3]).strip() if len(row2) > 3 else ""
+    if d2 == _CABECALHO_FIXO[3]:
+        return {"aba": aba.title, "status": "pulada", "motivo": "já migrada"}
+
+    # Nome/matrícula ficam nas colunas B/C tanto antes quanto depois da
+    # migração — dá pra ler o roster sem esperar o insert de colunas.
+    roster = _ler_roster(valores)
+    linha_fim = roster[-1]["linha"] if roster else _LINHA_DADOS - 1
+
+    if dry_run:
+        return {"aba": aba.title, "status": "seria migrada", "alunos": len(roster)}
+
+    _com_retry(lambda: _inserir_colunas(spreadsheet, aba, 3, 2))
+
+    updates = [{
+        "range":  f"A{_LINHA_CABECALHO}:E{_LINHA_CABECALHO}",
+        "values": [_CABECALHO_FIXO],
+    }]
+    if linha_fim >= _LINHA_DADOS:
+        updates.append({
+            "range": f"D{_LINHA_DADOS}:D{linha_fim}",
+            "values": [
+                [_formula_presencas_mes(l)]
+                for l in range(_LINHA_DADOS, linha_fim + 1)
+            ],
+        })
+    _com_retry(lambda: aba.batch_update(updates, value_input_option="USER_ENTERED"))
+
+    valores = _com_retry(aba.get_all_values)
+    grupos = _ler_grupos(valores)
+
+    _com_retry(lambda: _formatar_colunas_fixas(spreadsheet, aba, linha_fim))
+    for g in grupos:
+        _com_retry(lambda g=g: _aplicar_formatacao_horizontal(
+            spreadsheet, aba, g["col"], len(g["dias"]), linha_fim
+        ))
+
+    return {"aba": aba.title, "status": "migrada", "alunos": len(roster)}
 
 
 # --- DASHBOARD ANALÍTICO (Looker Studio) ---

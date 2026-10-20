@@ -59,17 +59,23 @@ _BRANCO        = {"red": 1.0,  "green": 1.0,  "blue": 1.0}
 
 # --- Geometria do layout horizontal ---
 _PREFIXO_PERIODO = "Período: "
-_COL_FIXAS       = 5   # Nº, Nome, Matrícula, Presenças no Mês, Justificou Ausência?
+_COL_FIXAS       = 7   # Nº, Nome, Matrícula, Presenças no Mês, Justificou Ausência?, Justificativa, Qtd. dias justificados
 _LINHA_PERIODO   = 1   # 1-indexed
 _LINHA_CABECALHO = 2
 _LINHA_DADOS     = 3   # primeira linha de aluno
 
+# Layout de referência: planilha da Ondina.
 _CABECALHO_FIXO = [
     "Nº", "Nome", "Matrícula", "Presenças no Mês", "Justificou Ausência?",
+    "Justificativa", "Quantidade de dias justificados",
 ]
+_COL_PRESENCAS_MES      = _CABECALHO_FIXO.index("Presenças no Mês")
+_COL_FREQUENCIA         = _CABECALHO_FIXO.index("Justificou Ausência?")
+_COL_JUSTIFICATIVA      = _CABECALHO_FIXO.index("Justificativa")
+_COL_DIAS_JUSTIFICADOS  = _CABECALHO_FIXO.index("Quantidade de dias justificados")
 
-# Dropdown da coluna "Justificou Ausência?" — vazio = nada a justificar ainda.
-_OPCOES_JUSTIFICATIVA = ["Sim", "Não"]
+# Presenças mínimas no mês para contar como frequente (10 conta; 9 não).
+_LIMITE_FREQUENCIA = 10
 
 
 def _col_letra(indice_0idx):
@@ -82,7 +88,8 @@ def _col_letra(indice_0idx):
     return letras
 
 
-_COL_PERIODOS_LETRA = _col_letra(_COL_FIXAS)  # primeira coluna depois das fixas
+_ULTIMA_FIXA = _col_letra(_COL_FIXAS - 1)
+_COL_ANCORA_SOMA_LETRA = _ULTIMA_FIXA  # última coluna fixa
 
 
 def _formula_presencas_mes(linha):
@@ -90,21 +97,50 @@ def _formula_presencas_mes(linha):
     Formula da coluna "Presenças no Mês": soma todas as colunas "Presenças"
     (uma por grupo de período) daquela linha.
 
-    Usa a linha inteira (a partir da primeira coluna de período) como
-    critério/soma em vez de colunas fixas porque o número de períodos e a
-    posição de cada grupo mudam a cada semana nova inserida — a fórmula não
-    pode depender disso para continuar somando certo. Não pode incluir as
-    colunas fixas no intervalo: isso incluiria a própria célula da fórmula e
-    o Sheets recusa como referência circular.
+    Usa a linha inteira (a partir da última coluna fixa) como critério/soma em
+    vez de colunas fixas porque o número de períodos e a posição de cada grupo
+    mudam a cada semana nova inserida. Duas escolhas evitam que o Sheets
+    desloque a faixa quando colunas/linhas são inseridas:
+      - começa na última coluna fixa, não na primeira de período: uma coluna
+        inserida logo depois dela cai DENTRO da faixa e ela cresce; começando
+        na primeira de período, a inserção empurraria a faixa para a direita e
+        o primeiro período sairia da soma. A coluna da própria fórmula (D) e as
+        colunas E/F (que dependem dela) ficam de fora: incluí-las seria
+        referência circular.
+      - a linha do cabeçalho é absoluta ($2): sem isso, copiar/inserir linhas
+        faz o critério apontar para a linha errada.
 
     Separador de argumento é ";" (não ","): as planilhas são pt_BR, e nesse
     locale o Sheets exige ";" — "," daria "Formula parse error.".
     """
-    c = _COL_PERIODOS_LETRA
+    c = _COL_ANCORA_SOMA_LETRA
     return (
-        f'=SUMIF({c}{_LINHA_CABECALHO}:{_LINHA_CABECALHO};'
+        f'=SUMIF({c}${_LINHA_CABECALHO}:${_LINHA_CABECALHO};'
         f'"Presenças";{c}{linha}:{linha})'
     )
+
+
+def _formula_frequencia(linha):
+    """Coluna E: frequente com `_LIMITE_FREQUENCIA` ou mais presenças no mês."""
+    d = _col_letra(_COL_PRESENCAS_MES)
+    return f'=IF({d}{linha}<{_LIMITE_FREQUENCIA};"Não Frequente";"Frequente")'
+
+
+def _formula_justificativa(linha):
+    """Coluna F: frequente, justificado (dias justificados fecham o limite) ou não."""
+    d = _col_letra(_COL_PRESENCAS_MES)
+    g = _col_letra(_COL_DIAS_JUSTIFICADOS)
+    lim = _LIMITE_FREQUENCIA
+    return (
+        f'=IF({d}{linha}>={lim};"Frequente";'
+        f'IF({d}{linha}+{g}{linha}>={lim};"Justificado";"Não justificado"))'
+    )
+
+
+def _formulas_colunas_fixas(linha):
+    """Fórmulas das colunas D, E e F de uma linha de aluno."""
+    return [_formula_presencas_mes(linha), _formula_frequencia(linha),
+            _formula_justificativa(linha)]
 
 _DIA_SEMANA_PT = {
     "Segunda": 0,
@@ -236,9 +272,12 @@ def _garantir_grade(aba, linhas, colunas):
         aba.add_cols(colunas - aba.col_count + 20)
 
 
-def _ler_grupos(valores):
+def _ler_grupos(valores, col_min=None):
     """
     Lê os grupos de período a partir das linhas 1 e 2.
+
+    `col_min`: primeira coluna (0-idx) onde pode começar um grupo; o padrão é
+    `_COL_FIXAS`. Só muda para ler abas ainda fora do layout padrão.
 
     Retorna lista de dicts:
         {periodo, col (0-idx da coluna "Presenças"), dias, cols_dias, largura}
@@ -251,9 +290,11 @@ def _ler_grupos(valores):
 
     # Só a partir das colunas fixas: no layout vertical antigo o marcador fica
     # na coluna A e não pode ser confundido com um grupo horizontal.
+    if col_min is None:
+        col_min = _COL_FIXAS
     inicios = [
         j for j, v in enumerate(row1)
-        if j >= _COL_FIXAS and str(v).strip().startswith(_PREFIXO_PERIODO)
+        if j >= col_min and str(v).strip().startswith(_PREFIXO_PERIODO)
     ]
 
     grupos = []
@@ -439,6 +480,10 @@ def _reordenar_grupos(spreadsheet, aba, valores, grupos, linha_fim):
     for i in range(linha_fim):
         row = valores[i] if i < len(valores) else []
         nova = [celula(row, c) for c in range(_COL_FIXAS)]
+        if i + 1 >= _LINHA_DADOS:
+            # `valores` traz o resultado calculado, não a fórmula: copiar as
+            # colunas D/E/F como vieram as congelaria em valores fixos.
+            nova[_COL_PRESENCAS_MES:_COL_JUSTIFICATIVA + 1] = _formulas_colunas_fixas(i + 1)
         for cols in origem:
             nova += [celula(row, c) for c in cols]
         nova += [""] * (largura - len(nova))
@@ -605,7 +650,7 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
             "values": [[_marcador_periodo(periodo)]],
         },
         {
-            "range":  f"A{_LINHA_CABECALHO}:E{_LINHA_CABECALHO}",
+            "range":  f"A{_LINHA_CABECALHO}:{_ULTIMA_FIXA}{_LINHA_CABECALHO}",
             "values": [_CABECALHO_FIXO],
         },
         {
@@ -619,9 +664,9 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
 
     if novos:
         updates.append({
-            "range":  f"A{novos[0]['linha']}:E{linha_fim}",
+            "range":  f"A{novos[0]['linha']}:{_ULTIMA_FIXA}{linha_fim}",
             "values": [
-                [n["num"], n["nome"], n["mat"], _formula_presencas_mes(n["linha"]), ""]
+                [n["num"], n["nome"], n["mat"]] + _formulas_colunas_fixas(n["linha"]) + [""]
                 for n in novos
             ],
         })
@@ -663,7 +708,10 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
                 "fields": "gridProperties(frozenRowCount,frozenColumnCount)",
             }
         },
-        # A1:C1 — faixa vazia acima do cabeçalho fixo
+        # Um filtro existente impede mesclar através das suas bordas: remove
+        # agora e recoloca (coluna Justificativa) no fim.
+        {"clearBasicFilter": {"sheetId": sheet_id}},
+        # A1:G1 — faixa vazia acima do cabeçalho fixo
         {"unmergeCells": {"range": rng(0, 1)}},
         {"mergeCells": {"range": rng(0, 1), "mergeType": "MERGE_ALL"}},
         {
@@ -740,27 +788,23 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
                 "properties": {"pixelSize": px}, "fields": "pixelSize",
             }
         }
-        for col, px in [(0, 45), (1, 250), (2, 110), (3, 130), (4, 150)]
+        for col, px in [(0, 45), (1, 250), (2, 110), (3, 130), (4, 150),
+                        (5, 140), (6, 200)]
     ]
 
-    # Dropdown "Justificou Ausência?" — vazio continua permitido (nada a
-    # justificar ainda), só restringe o que pode ser digitado quando preenchido.
-    if linha_fim >= _LINHA_DADOS:
-        requests.append({
-            "setDataValidation": {
-                "range": rng(_LINHA_DADOS - 1, linha_fim, c0=4, c1=5),
-                "rule": {
-                    "condition": {
-                        "type": "ONE_OF_LIST",
-                        "values": [
-                            {"userEnteredValue": v} for v in _OPCOES_JUSTIFICATIVA
-                        ],
-                    },
-                    "showCustomUi": True,
-                    "strict": True,
-                },
-            }
-        })
+    requests.append({
+        "setBasicFilter": {"filter": {"range": rng(
+            _LINHA_CABECALHO - 1, max(linha_fim, _LINHA_DADOS),
+            c0=_COL_JUSTIFICATIVA, c1=_COL_JUSTIFICATIVA + 1)}}
+    })
+
+    # A coluna E é fórmula: remove o dropdown Sim/Não que existia nela.
+    requests.append({
+        "setDataValidation": {
+            "range": rng(_LINHA_DADOS - 1, max(linha_fim, _LINHA_DADOS),
+                         c0=_COL_FREQUENCIA, c1=_COL_FREQUENCIA + 1),
+        }
+    })
 
     spreadsheet.batch_update({"requests": requests})
 
@@ -1262,30 +1306,226 @@ def diagnosticar_aba(restaurante_key, nome_aba):
     }
 
 
-# --- MIGRAÇÃO: colunas "Presenças no Mês" e "Justificou Ausência?" ---------
+# --- PADRONIZAÇÃO das colunas fixas (referência: planilha da Ondina) --------
 #
-# `exportar_para_sheets` já grava essas duas colunas em toda aba nova (e em
-# todo aluno novo de uma aba já migrada) desde que `_COL_FIXAS` passou a
-# valer 5. Mas abas mensais que já existiam antes disso ainda têm só 3
-# colunas fixas — esta migração insere as 2 colunas que faltam nelas, uma vez,
-# sem tocar nos dados de presença já lançados.
+# As abas mensais nasceram com 3 colunas fixas e foram ganhando colunas à mão,
+# cada uma de um jeito (4, 5 ou 7 colunas; "Frequência" ou "Justificou
+# Ausência?"; limite de frequência 9, 10 ou "<=10"). Esta rotina leva todas ao
+# mesmo layout de `_CABECALHO_FIXO`, sem tocar nas marcações de presença.
 
-def migrar_colunas_extras(restaurante_key, nomes_abas=None, dry_run=False):
+def _colunas_fixas_atuais(valores):
     """
-    Insere as colunas "Presenças no Mês" (fórmula) e "Justificou Ausência?"
-    (dropdown Sim/Não) nas abas mensais de um restaurante que ainda estão no
-    layout de 3 colunas fixas.
+    Quantas colunas fixas a aba tem hoje: posição (0-idx) do primeiro cabeçalho
+    "Presenças" de período na linha 2 (ou, sem nenhum período, quantas colunas
+    de cabeçalho fixo existem). None se não for o layout horizontal.
+    """
+    row1 = valores[0] if valores else []
+    row2 = valores[1] if len(valores) > 1 else []
+    if not any(str(v).strip().startswith(_PREFIXO_PERIODO) for v in row1):
+        # Aba nova, ainda sem período lançado: só as colunas fixas no cabeçalho
+        if len(row2) > _COL_PRESENCAS_MES and \
+                str(row2[_COL_PRESENCAS_MES]).strip() == "Presenças no Mês":
+            n = 0
+            while n < len(row2) and str(row2[n]).strip():
+                n += 1
+            return n
+        return None
+    for j in range(3, len(row2)):
+        if str(row2[j]).strip() == "Presenças":
+            return j
+    return None
 
-    Idempotente: uma aba que já tem o cabeçalho novo em D2 é pulada, então
-    rodar de novo não duplica nada.
 
-    Args:
-        restaurante_key: "canela" | "ondina" | "sao_lazaro"
-        nomes_abas: nomes de aba a considerar; None = todas as abas da planilha
-        dry_run: se True, só relata o que faria, sem gravar nada
+def _snapshot_marcas(valores, col_min=None):
+    """
+    {(matrícula/nome, período, dia): marca} de todos os grupos — o que precisa
+    sobreviver intacto à padronização, qualquer que seja o nº de colunas fixas.
+    """
+    grupos = _ler_grupos(valores, col_min)
+    snap = {}
+    for r in _ler_roster(valores):
+        row = valores[r["linha"] - 1]
+        chave = r["mat"] or r["nome"]
+        for g in grupos:
+            for dia, c in g["cols_dias"].items():
+                snap[(chave, g["periodo"], dia)] = str(row[c]).strip() if c < len(row) else ""
+            c = g["col"]
+            snap[(chave, g["periodo"], "Presenças")] = str(row[c]).strip() if c < len(row) else ""
+    return snap
+
+
+def _padronizar_aba(spreadsheet, aba, dry_run, dir_backup=None):
+    formulas = _com_retry(lambda: aba.get_all_values(value_render_option="FORMULA"))
+    if not formulas:
+        return {"aba": aba.title, "status": "pulada", "motivo": "aba vazia"}
+
+    n_atual = _colunas_fixas_atuais(formulas)
+    if n_atual is None:
+        return {"aba": aba.title, "status": "pulada",
+                "motivo": "não é layout horizontal (sem marcador de período)"}
+    if n_atual > _COL_FIXAS:
+        return {"aba": aba.title, "status": "pulada",
+                "motivo": f"{n_atual} colunas fixas (mais que o padrão {_COL_FIXAS})"}
+    if n_atual < _COL_PRESENCAS_MES + 1:
+        return {"aba": aba.title, "status": "pulada",
+                "motivo": "sem a coluna \"Presenças no Mês\""}
+
+    roster = _ler_roster(formulas)
+    if not roster:
+        return {"aba": aba.title, "status": "pulada", "motivo": "sem alunos"}
+    linha_fim = roster[-1]["linha"]
+    inserir = _COL_FIXAS - n_atual
+
+    if dry_run:
+        return {"aba": aba.title, "status": "seria padronizada",
+                "alunos": len(roster), "colunas_novas": inserir}
+
+    if dir_backup:
+        import json
+        os.makedirs(dir_backup, exist_ok=True)
+        nome = re.sub(r"[^\w.-]+", "_", f"{spreadsheet.id}_{aba.title}") + ".json"
+        with open(os.path.join(dir_backup, nome), "w", encoding="utf-8") as f:
+            json.dump({"aba": aba.title, "colunas_fixas_antes": n_atual,
+                       "linhas": formulas[:linha_fim]}, f, ensure_ascii=False)
+
+    antes = _snapshot_marcas(formulas, n_atual)
+
+    if inserir:
+        _com_retry(lambda: _inserir_colunas(spreadsheet, aba, n_atual, inserir))
+
+    ult = _ULTIMA_FIXA
+    d, f_ = _col_letra(_COL_PRESENCAS_MES), _col_letra(_COL_JUSTIFICATIVA)
+    updates = [
+        {"range": f"A{_LINHA_CABECALHO}:{ult}{_LINHA_CABECALHO}",
+         "values": [_CABECALHO_FIXO]},
+        {"range": f"{d}{_LINHA_DADOS}:{f_}{linha_fim}",
+         "values": [_formulas_colunas_fixas(l)
+                    for l in range(_LINHA_DADOS, linha_fim + 1)]},
+    ]
+    _com_retry(lambda: aba.batch_update(updates, value_input_option="USER_ENTERED"))
+    _com_retry(lambda: _formatar_colunas_fixas(spreadsheet, aba, linha_fim))
+
+    depois = _snapshot_marcas(_com_retry(aba.get_all_values))
+    if depois != antes:
+        trocadas = [k for k in antes if depois.get(k) != antes[k]][:5]
+        raise RuntimeError(
+            f"marcações mudaram após padronizar (ex.: {trocadas}) — "
+            f"conferir o backup em {dir_backup or '(sem backup)'}"
+        )
+    return {"aba": aba.title, "status": "padronizada",
+            "alunos": len(roster), "colunas_novas": inserir}
+
+
+def padronizar_planilhas(restaurante_key, nomes_abas=None, dry_run=False,
+                         dir_backup=None):
+    """
+    Leva as abas mensais de um restaurante ao layout de referência (Ondina):
+    `_CABECALHO_FIXO`, fórmulas de D/E/F em todas as linhas de aluno, limite de
+    frequência `_LIMITE_FREQUENCIA`, formatação e congelamento das colunas
+    fixas. Marcações de presença e "Quantidade de dias justificados" não são
+    tocadas — e as marcações são conferidas contra a leitura anterior.
+
+    Idempotente. `dir_backup`: grava o conteúdo anterior das linhas de aluno
+    (com fórmulas) em um JSON por aba antes de alterar.
 
     Returns:
-        [{"aba", "status": "migrada"|"pulada"|"seria migrada"|"erro", ...}]
+        [{"aba", "status": "padronizada"|"seria padronizada"|"pulada"|"erro", ...}]
+    """
+    import time
+
+    config = _carregar_config()
+    rest = config.get("restaurantes", {}).get(restaurante_key, {})
+    spreadsheet_id = rest.get("spreadsheet_id", "").strip()
+    if not spreadsheet_id:
+        raise RuntimeError(
+            f"spreadsheet_id não configurado para '{restaurante_key}' "
+            "em config_sheets.yaml"
+        )
+
+    spreadsheet = _com_retry(lambda: _obter_cliente(config).open_by_key(spreadsheet_id))
+    abas = _com_retry(spreadsheet.worksheets)
+    if nomes_abas is not None:
+        nomes = set(nomes_abas)
+        abas = [a for a in abas if a.title in nomes]
+
+    resultados = []
+    for aba in abas:
+        try:
+            resultados.append(_padronizar_aba(spreadsheet, aba, dry_run, dir_backup))
+        except Exception as e:
+            resultados.append({"aba": aba.title, "status": "erro", "erro": str(e)})
+        time.sleep(3)  # folga na cota de leituras por minuto
+    return resultados
+
+
+def migrar_colunas_extras(restaurante_key, nomes_abas=None, dry_run=False):
+    """Mantido por compatibilidade: a migração agora é a padronização."""
+    return padronizar_planilhas(restaurante_key, nomes_abas, dry_run)
+
+
+# --- REPARO: "Presenças no Mês" congelada em número fixo --------------------
+#
+# Antes de `_reordenar_grupos` regerar a fórmula, a reordenação de períodos
+# copiava o valor calculado da coluna D e a fórmula virava um número fixo.
+
+def _linhas_presencas_mes_a_reparar(valores_formula, linha_fim):
+    """
+    Linhas de aluno (1-idx) cuja coluna "Presenças no Mês" não tem a fórmula
+    esperada. `valores_formula` deve vir com value_render_option=FORMULA.
+    """
+    c = _COL_PRESENCAS_MES
+    quebradas = []
+    for linha in range(_LINHA_DADOS, linha_fim + 1):
+        row = valores_formula[linha - 1] if linha - 1 < len(valores_formula) else []
+        atual = str(row[c]).strip() if c < len(row) else ""
+        if atual != _formula_presencas_mes(linha):
+            quebradas.append(linha)
+    return quebradas
+
+
+def _reparar_aba_presencas_mes(aba, dry_run):
+    valores = _com_retry(aba.get_all_values)
+    if not valores:
+        return {"aba": aba.title, "status": "pulada", "motivo": "aba vazia"}
+
+    row2 = valores[1] if len(valores) > 1 else []
+    if (str(row2[_COL_PRESENCAS_MES]).strip() if len(row2) > _COL_PRESENCAS_MES else "") \
+            != _CABECALHO_FIXO[_COL_PRESENCAS_MES]:
+        return {"aba": aba.title, "status": "pulada",
+                "motivo": "sem a coluna \"Presenças no Mês\" (não migrada)"}
+
+    roster = _ler_roster(valores)
+    if not roster:
+        return {"aba": aba.title, "status": "pulada", "motivo": "sem alunos"}
+    linha_fim = roster[-1]["linha"]
+
+    formulas = _com_retry(lambda: aba.get_all_values(value_render_option="FORMULA"))
+    quebradas = _linhas_presencas_mes_a_reparar(formulas, linha_fim)
+    if not quebradas:
+        return {"aba": aba.title, "status": "ok", "alunos": len(roster)}
+    if dry_run:
+        return {"aba": aba.title, "status": "seria reparada",
+                "reparadas": len(quebradas), "alunos": len(roster)}
+
+    letra = _col_letra(_COL_PRESENCAS_MES)
+    updates = [
+        {"range": f"{letra}{linha}", "values": [[_formula_presencas_mes(linha)]]}
+        for linha in quebradas
+    ]
+    _com_retry(lambda: aba.batch_update(updates, value_input_option="USER_ENTERED"))
+    return {"aba": aba.title, "status": "reparada",
+            "reparadas": len(quebradas), "alunos": len(roster)}
+
+
+def reparar_presencas_mes(restaurante_key, nomes_abas=None, dry_run=False):
+    """
+    Regrava a fórmula da coluna "Presenças no Mês" nas linhas de aluno em que
+    ela virou número fixo (ou ficou vazia/errada). Só toca na coluna D, e só
+    nas linhas que divergem da fórmula esperada — dados de presença ficam
+    intactos. Idempotente.
+
+    Returns:
+        [{"aba", "status": "reparada"|"seria reparada"|"ok"|"pulada"|"erro", ...}]
     """
     config = _carregar_config()
     rest = config.get("restaurantes", {}).get(restaurante_key, {})
@@ -1296,9 +1536,7 @@ def migrar_colunas_extras(restaurante_key, nomes_abas=None, dry_run=False):
             "em config_sheets.yaml"
         )
 
-    cliente = _obter_cliente(config)
-    spreadsheet = cliente.open_by_key(spreadsheet_id)
-
+    spreadsheet = _obter_cliente(config).open_by_key(spreadsheet_id)
     abas = _com_retry(spreadsheet.worksheets)
     if nomes_abas is not None:
         nomes = set(nomes_abas)
@@ -1307,67 +1545,10 @@ def migrar_colunas_extras(restaurante_key, nomes_abas=None, dry_run=False):
     resultados = []
     for aba in abas:
         try:
-            resultados.append(_migrar_aba_colunas_extras(spreadsheet, aba, dry_run))
+            resultados.append(_reparar_aba_presencas_mes(aba, dry_run))
         except Exception as e:
             resultados.append({"aba": aba.title, "status": "erro", "erro": str(e)})
     return resultados
-
-
-def _migrar_aba_colunas_extras(spreadsheet, aba, dry_run):
-    valores = _com_retry(aba.get_all_values)
-    if not valores:
-        return {"aba": aba.title, "status": "pulada", "motivo": "aba vazia"}
-
-    row1 = valores[0]
-    row2 = valores[1] if len(valores) > 1 else []
-
-    tem_periodo = any(
-        str(v).strip().startswith(_PREFIXO_PERIODO) for v in row1
-    )
-    if not tem_periodo:
-        return {
-            "aba": aba.title, "status": "pulada",
-            "motivo": "não é layout horizontal (sem marcador de período)",
-        }
-
-    d2 = str(row2[3]).strip() if len(row2) > 3 else ""
-    if d2 == _CABECALHO_FIXO[3]:
-        return {"aba": aba.title, "status": "pulada", "motivo": "já migrada"}
-
-    # Nome/matrícula ficam nas colunas B/C tanto antes quanto depois da
-    # migração — dá pra ler o roster sem esperar o insert de colunas.
-    roster = _ler_roster(valores)
-    linha_fim = roster[-1]["linha"] if roster else _LINHA_DADOS - 1
-
-    if dry_run:
-        return {"aba": aba.title, "status": "seria migrada", "alunos": len(roster)}
-
-    _com_retry(lambda: _inserir_colunas(spreadsheet, aba, 3, 2))
-
-    updates = [{
-        "range":  f"A{_LINHA_CABECALHO}:E{_LINHA_CABECALHO}",
-        "values": [_CABECALHO_FIXO],
-    }]
-    if linha_fim >= _LINHA_DADOS:
-        updates.append({
-            "range": f"D{_LINHA_DADOS}:D{linha_fim}",
-            "values": [
-                [_formula_presencas_mes(l)]
-                for l in range(_LINHA_DADOS, linha_fim + 1)
-            ],
-        })
-    _com_retry(lambda: aba.batch_update(updates, value_input_option="USER_ENTERED"))
-
-    valores = _com_retry(aba.get_all_values)
-    grupos = _ler_grupos(valores)
-
-    _com_retry(lambda: _formatar_colunas_fixas(spreadsheet, aba, linha_fim))
-    for g in grupos:
-        _com_retry(lambda g=g: _aplicar_formatacao_horizontal(
-            spreadsheet, aba, g["col"], len(g["dias"]), linha_fim
-        ))
-
-    return {"aba": aba.title, "status": "migrada", "alunos": len(roster)}
 
 
 # --- DASHBOARD ANALÍTICO (Looker Studio) ---

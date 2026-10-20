@@ -198,7 +198,7 @@ def processar_scan():
     try:
         from exportar import (
             carregar_todas_paginas, processar_pdf_completo,
-            contar_presencas, exportar_xlsx,
+            contar_presencas, exportar_xlsx, completar_paginas_ausentes,
         )
         from ler_bolhas import get_zona_ambigua
 
@@ -206,7 +206,13 @@ def processar_scan():
         dpi = config["scan"]["dpi"]
 
         paginas = carregar_todas_paginas(*pdfs, dpi=dpi)
-        resultados = processar_pdf_completo(paginas, config)
+        diagnostico_scan = {}
+        resultados = processar_pdf_completo(paginas, config, diagnostico=diagnostico_scan)
+        resultados, ausentes = completar_paginas_ausentes(
+            resultados, lote_escolhido, diagnostico_scan
+        )
+        for aviso in ausentes["avisos"]:
+            print(f"\n  AVISO: {aviso}")
 
         # Identidade congelada na impressão — nunca a planilha de hoje.
         alunos = lote_mod.roster_do_lote(lote_escolhido)

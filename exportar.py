@@ -357,6 +357,7 @@ def processar_pdf_completo(paginas, config, retornar_imagens=False, pagina_inici
     if diagnostico is not None:
         diagnostico["ordem_confiavel"] = False
         diagnostico["motivo_ordem"] = ""
+        diagnostico["paginas_sem_leitura"] = []
 
     alunos_por_pagina = config["layout"]["alunos_por_pagina"]
     todos_resultados = []
@@ -419,6 +420,13 @@ def processar_pdf_completo(paginas, config, retornar_imagens=False, pagina_inici
         numeros, aviso = _inferir_numeros_paginas(detectados)
 
         if numeros is not None:
+            if diagnostico is not None:
+                # Páginas cujo número NÃO foi lido (só deduzido pela sequência):
+                # ao lado de uma página ausente, a dedução é ambígua.
+                diagnostico["paginas_sem_leitura"] = [
+                    n for p, n in zip(paginas_brutas, numeros)
+                    if p["num_detectado"] is None
+                ]
             for p, n in zip(paginas_brutas, numeros):
                 p["num_detectado"] = n
             todos_detectados = True
@@ -485,6 +493,100 @@ def processar_pdf_completo(paginas, config, retornar_imagens=False, pagina_inici
     if retornar_imagens:
         return todos_resultados, paginas_alinhadas_out, binarios_out, resultados_por_pagina_out
     return todos_resultados
+
+
+# --- PÁGINA AUSENTE NO SCAN ---
+
+def completar_paginas_ausentes(resultados, lote, diagnostico=None):
+    """
+    Marca presença em todos os dias para quem estava numa página que não veio
+    no scan.
+
+    Uma folha se perde no maço de vez em quando; sem isso a lista inteira
+    ficava sem leitura. O lote sabe quem estava em cada página, então a
+    página ausente é identificada pelo número e as pessoas dela entram com
+    todos os dias (almoço e janta) marcados — presença PRESUMIDA, não lida.
+
+    Só age quando dá para saber com segurança qual página faltou:
+      - a ordem das páginas lidas tem que ser confiável (senão os números
+        das que vieram não são de confiança, e portanto nem os das ausentes);
+      - uma ausente colada numa página cujo número não foi lido (só deduzido)
+        é ambígua — "1,2,X,5,6" pode ser a 3 ou a 4 que faltou — e vira aviso
+        sem presunção alguma, em vez de dar presença à pessoa errada.
+
+    Args:
+        resultados: lista de resultados de `processar_pdf_completo`
+        lote: lote impresso (precisa de `alunos` com "numero"/"pagina", `dias`
+            e `alunos_por_pagina`)
+        diagnostico: dict preenchido por `processar_pdf_completo`
+
+    Returns:
+        (resultados com as pessoas das páginas ausentes, info) onde info é
+        {"ausentes": [páginas presumidas], "ambiguas": [páginas não resolvidas],
+         "presumidas": nº de pessoas, "avisos": [str]}
+    """
+    info = {"ausentes": [], "ambiguas": [], "presumidas": 0, "avisos": []}
+    if not lote or not lote.get("alunos"):
+        return resultados, info
+
+    por_pagina = lote["alunos_por_pagina"]
+    total = lote.get("total_paginas", 0)
+    lidas = {(r["numero"] - 1) // por_pagina + 1 for r in resultados}
+    if not lidas or not total:
+        return resultados, info
+
+    ausentes = [p for p in range(1, total + 1) if p not in lidas]
+    if not ausentes:
+        return resultados, info
+
+    if diagnostico is not None and not diagnostico.get("ordem_confiavel"):
+        info["avisos"].append(
+            f"Faltam as páginas {ausentes} do lote, mas a numeração das páginas "
+            "lidas não é confiável — nenhuma presença foi presumida. Reescaneie "
+            "ou confira a ordem."
+        )
+        info["ambiguas"] = ausentes
+        return resultados, info
+
+    sem_leitura = set((diagnostico or {}).get("paginas_sem_leitura", []))
+    resolvidas = []
+    for p in ausentes:
+        if (p - 1) in sem_leitura or (p + 1) in sem_leitura:
+            info["ambiguas"].append(p)
+        else:
+            resolvidas.append(p)
+
+    if info["ambiguas"]:
+        info["avisos"].append(
+            f"Faltam páginas do lote, mas não dá para saber com segurança "
+            f"qual(is): {info['ambiguas']} (ao lado há página com número "
+            "ilegível). Nenhuma presença foi presumida para elas — reescaneie "
+            "a folha."
+        )
+
+    dias = lote["dias"]
+    novos = []
+    for a in sorted(lote["alunos"], key=lambda x: x["numero"]):
+        if a["pagina"] in resolvidas:
+            novos.append({
+                "numero": a["numero"],
+                "presumida": True,
+                "dias": {
+                    d: {"almoco": True, "janta": True,
+                        "almoco_pct": 1.0, "janta_pct": 1.0}
+                    for d in dias
+                },
+            })
+
+    if novos:
+        info["ausentes"] = resolvidas
+        info["presumidas"] = len(novos)
+        info["avisos"].append(
+            f"Página(s) {resolvidas} do lote não vieram no scan: {len(novos)} "
+            "pessoa(s) receberam presença em TODOS os dias por presunção "
+            "(não foi lida). Confira e ajuste se for o caso."
+        )
+    return list(resultados) + novos, info
 
 
 # --- CONTAGEM DE PRESENÇAS ---

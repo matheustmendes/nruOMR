@@ -36,7 +36,7 @@ from ler_bolhas import (
     _get_threshold, _get_offset_y, get_zona_ambigua,
 )
 from exportar import (
-    carregar_todas_paginas, processar_pdf_completo,
+    carregar_todas_paginas, processar_pdf_completo, completar_paginas_ausentes,
     contar_presencas, ler_nomes_alunos, exportar_xlsx, eh_pagina_branca,
     aplicar_correcoes,
 )
@@ -244,9 +244,19 @@ def rota_processar():
 
         # Processa
         paginas = carregar_todas_paginas(scan_path, dpi=config["scan"]["dpi"])
+        diagnostico_scan = {}
+        pags_ausentes = {"ausentes": [], "presumidas": 0, "avisos": []}
         resultados, pags_alinhadas, binarios, resultados_por_pag = processar_pdf_completo(
-            paginas, config, retornar_imagens=True, pagina_inicial=pagina_inicial
+            paginas, config, retornar_imagens=True, pagina_inicial=pagina_inicial,
+            diagnostico=diagnostico_scan,
         )
+        # Página perdida no maço: as pessoas dela entram com presença presumida
+        # em vez de a lista inteira ficar sem leitura.
+        if lote:
+            resultados, pags_ausentes = completar_paginas_ausentes(
+                resultados, lote, diagnostico_scan
+            )
+            avisos_identidade.extend(pags_ausentes["avisos"])
         # O lote sabe quantas páginas foram impressas; ler mais do que isso
         # significa que entrou folha de outro lote no maço.
         if lote:
@@ -368,6 +378,8 @@ def rota_processar():
         return jsonify({
             "sucesso": True,
             "alunos": alunos_lidos,
+            "paginas_ausentes": pags_ausentes["ausentes"],
+            "presumidas": pags_ausentes["presumidas"],
             "com_presenca": com_presenca,
             "ambiguos": ambiguos,
             "paginas": len(paginas),

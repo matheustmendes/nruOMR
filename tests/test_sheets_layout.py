@@ -34,7 +34,7 @@ def _grade(linhas_alunos, dias=DIAS, periodo="12/05 a 16/05"):
 
     grade = [cabecalho_periodo, cabecalho_colunas]
     for i, (nome, mat, presencas, marcas) in enumerate(linhas_alunos, start=1):
-        grade.append([str(i), nome, mat, "", "", str(presencas)] +
+        grade.append([str(i), nome, mat] + [""] * (gs._COL_FIXAS - 3) + [str(presencas)] +
                      [marcas.get(d, "") for d in dias])
     return grade
 
@@ -143,13 +143,99 @@ class TestColunasFixasExtras:
     def test_cabecalho_inclui_presencas_mes_e_justificativa(self):
         assert gs._CABECALHO_FIXO == [
             "Nº", "Nome", "Matrícula", "Presenças no Mês", "Justificou Ausência?",
+            "Justificativa", "Quantidade de dias justificados",
         ]
+        assert gs._COL_FIXAS == len(gs._CABECALHO_FIXO)
 
-    def test_formula_presencas_mes_soma_a_partir_da_1a_coluna_de_periodo(self):
+    def test_formula_presencas_mes_ancora_na_ultima_coluna_fixa(self):
         # Separador ";" — a planilha é pt_BR, "," dá "Formula parse error."
         assert gs._formula_presencas_mes(7) == (
-            '=SUMIF(F2:2;"Presenças";F7:7)'
+            '=SUMIF(G$2:$2;"Presenças";G7:7)'
         )
+
+    def test_frequencia_10_conta_e_9_nao(self):
+        # O limite é 10 em todas as unidades: 9 presenças não é frequente
+        assert gs._formula_frequencia(5) == (
+            '=IF(D5<10;"Não Frequente";"Frequente")'
+        )
+        assert gs._LIMITE_FREQUENCIA == 10
+
+    def test_justificativa_usa_dias_justificados_da_coluna_g(self):
+        assert gs._formula_justificativa(5) == (
+            '=IF(D5>=10;"Frequente";'
+            'IF(D5+G5>=10;"Justificado";"Não justificado"))'
+        )
+
+    def test_colunas_fixas_atuais_acha_o_primeiro_grupo(self):
+        assert gs._colunas_fixas_atuais(_grade([("A", "1", 0, {})])) == gs._COL_FIXAS
+        # Aba antiga de 4 colunas fixas
+        antiga = [
+            ["", "", "", "", "Período: X", ""],
+            ["Nº", "Nome", "Matrícula", "Presenças no Mês", "Presenças", "Segunda"],
+        ]
+        assert gs._colunas_fixas_atuais(antiga) == 4
+        assert gs._colunas_fixas_atuais([["Nº", "Nome"], ["a"]]) is None
+
+
+class TestReordenarGruposPreservaFormula:
+
+    def test_presencas_no_mes_continua_formula_apos_reordenar(self):
+        # Períodos fora de ordem cronológica: força a permuta de blocos
+        f = gs._COL_FIXAS
+        grade = [
+            [""] * f + [gs._PREFIXO_PERIODO + "19/05 a 23/05", "", "",
+                        gs._PREFIXO_PERIODO + "12/05 a 16/05", "", ""],
+            list(gs._CABECALHO_FIXO) + ["Presenças", "Segunda", "Terça"] * 2,
+            ["1", "Fulana", "111", "3"] + [""] * (f - 4)
+            + ["1", "X", "", "2", "X", "X"],
+            ["2", "Ciclana", "222", "0"] + [""] * (f - 4)
+            + ["0", "", "", "0", "", ""],
+        ]
+        grupos = gs._ler_grupos(grade)
+
+        captura = {}
+
+        class Aba:
+            id = 1
+
+            def update(self, values, range_name, value_input_option):
+                captura["values"] = values
+
+        class Planilha:
+            def batch_update(self, body):
+                pass
+
+        gs._reordenar_grupos(Planilha(), Aba(), grade, grupos, linha_fim=4)
+
+        d = gs._COL_PRESENCAS_MES
+        assert captura["values"][2][d] == gs._formula_presencas_mes(3)
+        assert captura["values"][3][d] == gs._formula_presencas_mes(4)
+        assert captura["values"][2][gs._COL_FREQUENCIA] == gs._formula_frequencia(3)
+        assert captura["values"][2][gs._COL_JUSTIFICATIVA] == gs._formula_justificativa(3)
+        # Cabeçalhos não são tocados
+        assert captura["values"][1][d] == "Presenças no Mês"
+
+
+class TestRepararPresencasMes:
+
+    def test_detecta_so_as_linhas_sem_a_formula_esperada(self):
+        d = gs._COL_PRESENCAS_MES
+        cab = [""] * 6
+        linha_ok = [""] * 6
+        linha_ok[d] = gs._formula_presencas_mes(3)
+        linha_fixa = [""] * 6
+        linha_fixa[d] = "7"
+        linha_vazia = [""] * 6
+        formulas = [cab, cab, linha_ok, linha_fixa, linha_vazia]
+
+        assert gs._linhas_presencas_mes_a_reparar(formulas, 5) == [4, 5]
+
+    def test_tudo_certo_nao_repara_nada(self):
+        d = gs._COL_PRESENCAS_MES
+        linha = [""] * 6
+        linha[d] = gs._formula_presencas_mes(3)
+
+        assert gs._linhas_presencas_mes_a_reparar([[], [], linha], 3) == []
 
 
 class TestDetectarMatriculasDuplicadas:

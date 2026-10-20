@@ -20,3 +20,4 @@ lotes/
 auditoria_*.csv
 plano_correcao.csv
 reconciliacao_*.csv
+backups_padronizacao/

@@ -403,6 +403,46 @@ def rota_processar():
         return jsonify({"erro": str(e)}), 500
 
 
+# Restaurantes cuja lista vem da planilha SERVIÇO ALIMENTAÇÃO. As listas de FDS
+# (PDCA/PDSL) são subconjuntos que só existem na planilha de impressão.
+FONTE_PLANILHA_SERVICO = {
+    "canela": "canela",
+    "ondina": "ondina",
+    "sao_lazaro": "sao_lazaro",
+    "ondina_fds_especial": "ondina",
+}
+
+
+def _info_da_planilha_servico(key):
+    """
+    `info` no formato de gerar_template.ler_planilha, lido da planilha SERVIÇO
+    ALIMENTAÇÃO (sem duplicados), mais os avisos que descrevem o que a busca fez.
+    """
+    origem = FONTE_PLANILHA_SERVICO.get(key)
+    if not origem:
+        raise ValueError(
+            "Este restaurante não tem lista na planilha SERVIÇO ALIMENTAÇÃO — "
+            "envie o arquivo .xlsx."
+        )
+    res = buscar_alunos_mod.buscar(origem, verbose=False)
+    avisos = [
+        f"Lista lida da planilha SERVIÇO ALIMENTAÇÃO: {len(res['alunos'])} estudantes únicos, "
+        f"{len(res['duplicados'])} duplicado(s) removido(s)."
+    ]
+    if res["sem_matricula"]:
+        avisos.append(f"{len(res['sem_matricula'])} estudante(s) sem matrícula na planilha.")
+    if res["outro_local"]:
+        avisos.append(
+            f"{len(res['outro_local'])} estudante(s) com a coluna LOCAL diferente da aba "
+            f"(entraram na lista da aba onde estão)."
+        )
+    # Mesmo rótulo em maiúsculas que vinha do cabeçalho da planilha de impressão
+    # ("CANELA"): é ele que vai pro cabeçalho do PDF e pro config do restaurante.
+    info = {"restaurante": buscar_alunos_mod.RESTAURANTES[origem][1], "mes_ano": "", "datas": "",
+            "alunos": buscar_alunos_mod.para_tuplas(res), "linhas_ignoradas": []}
+    return info, avisos
+
+
 @app.route("/gerar_template", methods=["POST"])
 def rota_gerar_template():
     try:
@@ -410,7 +450,9 @@ def rota_gerar_template():
         alunos_file = request.files.get("alunos")
         data_periodo = request.form.get("data_periodo", "").strip()
 
-        if not alunos_file:
+        fonte_planilha = request.form.get("fonte") == "planilha"
+
+        if not fonte_planilha and not alunos_file:
             return jsonify({"erro": "Envie a planilha de alunos"}), 400
 
         # Suporte a "todos"
@@ -423,14 +465,19 @@ def rota_gerar_template():
 
         alunos_tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
         alunos_tmp.close()
-        alunos_file.save(alunos_tmp.name)
+        if not fonte_planilha:
+            alunos_file.save(alunos_tmp.name)
 
         resultados_geracao = []
 
         for key in keys:
             rest = RESTAURANTES[key]
             try:
-                info = ler_planilha(alunos_tmp.name, rest["aba"])
+                avisos_fonte = []
+                if fonte_planilha:
+                    info, avisos_fonte = _info_da_planilha_servico(key)
+                else:
+                    info = ler_planilha(alunos_tmp.name, rest["aba"])
                 if not info["restaurante"]:
                     info["restaurante"] = rest["nome"]
                 if data_periodo:
@@ -481,7 +528,7 @@ def rota_gerar_template():
                     "paginas": novo_lote["total_paginas"],
                     "arquivo": caminho_pdf,
                     "lote_id": novo_lote["lote_id"],
-                    "avisos": novo_lote["avisos"],
+                    "avisos": avisos_fonte + novo_lote["avisos"],
                 })
 
             except Exception as e:
@@ -822,45 +869,19 @@ def rota_download():
     return send_file(caminho, as_attachment=True, download_name=nome)
 
 
-@app.route("/buscar_alunos", methods=["POST"])
-def rota_buscar_alunos():
-    """Busca os estudantes do restaurante na planilha SERVIÇO ALIMENTAÇÃO, sem duplicados."""
-    dados = request.get_json(silent=True) or {}
-    restaurante = dados.get("restaurante", "")
+@app.route("/buscar_alunos/download")
+def rota_buscar_alunos_download():
+    """Baixa, em .xlsx, a lista de estudantes (sem duplicados) lida da planilha SERVIÇO ALIMENTAÇÃO."""
+    restaurante = request.args.get("restaurante", "")
     if restaurante not in buscar_alunos_mod.RESTAURANTES:
-        return jsonify({"erro": "Restaurante inválido."}), 400
+        return "Restaurante inválido", 400
     try:
         res = buscar_alunos_mod.buscar(restaurante, verbose=False)
         pasta = tempfile.mkdtemp(prefix="alunos_")
         caminho = buscar_alunos_mod.salvar_xlsx(res, os.path.join(pasta, f"lista_{restaurante}.xlsx"))
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"erro": f"Não foi possível buscar na planilha: {e}"}), 500
-
-    app.config.setdefault("ALUNOS_XLSX", {})[restaurante] = caminho
-
-    def _item(a):
-        return {"nome": a["nome"], "matricula": a["matricula"], "linha": a["linha"],
-                "local": a["local"]}
-
-    return jsonify({
-        "total": len(res["alunos"]),
-        "duplicados": [
-            {**_item(d), "linha_original": o["linha"] if o else None}
-            for d, o in res["duplicados"]
-        ],
-        "sem_matricula": [_item(a) for a in res["sem_matricula"]],
-        "outro_local": [_item(a) for a in res["outro_local"]],
-        "alunos": [_item(a) for a in res["alunos"]],
-    })
-
-
-@app.route("/buscar_alunos/download")
-def rota_buscar_alunos_download():
-    restaurante = request.args.get("restaurante", "")
-    caminho = app.config.get("ALUNOS_XLSX", {}).get(restaurante)
-    if not caminho or not os.path.exists(caminho):
-        return "Nenhuma lista gerada para este restaurante", 404
+        return f"Não foi possível buscar na planilha: {e}", 500
     return send_file(caminho, as_attachment=True, download_name=f"lista_{restaurante}.xlsx")
 
 
@@ -1494,7 +1515,6 @@ body {
         <button class="tab" onclick="switchTab('recuperar', this)">Recuperar lote</button>
         <button class="tab" onclick="switchTab('limpar', this)">Limpar lotes antigos</button>
         <button class="tab" onclick="switchTab('duplicado', this); carregarLotesDup();">Unir listas duplicadas</button>
-        <button class="tab" onclick="switchTab('alunos', this)">Buscar alunos</button>
     </div>
 
     <!-- ABA: GERAR TEMPLATE -->
@@ -1534,19 +1554,34 @@ body {
             </div>
 
             <div class="section">
-                <div class="label">Planilha de alunos (.xlsx)</div>
-                <div id="upload-template-zone" class="upload-zone">
-                    <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'template')">
-                    <div class="upload-icon">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
-                    </div>
-                    <div class="upload-text">Arraste o arquivo ou clique para selecionar</div>
-                    <div class="upload-hint">.xlsx exportado do Google Sheets</div>
+                <div class="label">Lista de alunos</div>
+                <div class="radio-group" id="fonte-template-group">
+                    <label class="radio selected" id="fonte-planilha-opt" onclick="selectFonteTemplate(this)">
+                        <input type="radio" name="fonte-template" value="planilha" checked> Buscar na planilha SERVIÇO ALIMENTAÇÃO
+                    </label>
+                    <label class="radio" id="fonte-arquivo-opt" onclick="selectFonteTemplate(this)">
+                        <input type="radio" name="fonte-template" value="arquivo"> Enviar arquivo .xlsx
+                    </label>
                 </div>
-                <div id="file-template" class="file-pill" style="display:none;">
-                    <div class="file-icon">XLS</div>
-                    <div class="file-name" id="file-template-name"></div>
-                    <div class="file-remove" onclick="removeFile('template')">remover</div>
+                <div id="fonte-planilha-info" class="upload-hint" style="margin-top:8px;">
+                    Lê direto da planilha, ignora as linhas de título (SAT, PEC-G...) e remove duplicados.
+                    <span id="fonte-planilha-links"></span>
+                </div>
+
+                <div id="upload-template-wrap" style="display:none;margin-top:10px;">
+                    <div id="upload-template-zone" class="upload-zone">
+                        <input type="file" name="alunos" accept=".xlsx" onchange="fileSelected(this, 'template')">
+                        <div class="upload-icon">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4M4 18h16"/></svg>
+                        </div>
+                        <div class="upload-text">Arraste o arquivo ou clique para selecionar</div>
+                        <div class="upload-hint">.xlsx exportado do Google Sheets</div>
+                    </div>
+                    <div id="file-template" class="file-pill" style="display:none;">
+                        <div class="file-icon">XLS</div>
+                        <div class="file-name" id="file-template-name"></div>
+                        <div class="file-remove" onclick="removeFile('template')">remover</div>
+                    </div>
                 </div>
             </div>
 
@@ -1575,7 +1610,7 @@ body {
 
         <div class="loading" id="loading-template">
             <div class="spinner"></div>
-            Gerando template...
+            Gerando template... (buscando na planilha pode levar alguns segundos)
         </div>
 
         <div class="error-msg" id="error-template"></div>
@@ -1852,43 +1887,6 @@ body {
         <div id="result-limpar"></div>
     </div>
 
-    <div class="panel" id="panel-alunos">
-        <div style="font-size:12px;color:#999;margin-bottom:14px;">
-            Busca os estudantes direto na planilha <strong>SERVIÇO ALIMENTAÇÃO</strong>
-            (aba do restaurante), ignora as linhas de título (SAT, PEC-G etc.) e
-            remove os duplicados. O arquivo baixado já está no formato do
-            <strong>Gerar template</strong> — dá pra enviar direto lá, sem copiar
-            e colar entre planilhas.
-        </div>
-
-        <form id="form-alunos" onsubmit="return submitBuscarAlunos(event)">
-            <div class="section">
-                <div class="label">Restaurante</div>
-                <div class="radio-group">
-                    <label class="radio selected" onclick="selectRadio(this, 'rest-alunos')">
-                        <input type="radio" name="rest-alunos" value="canela" checked> Canela
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-alunos')">
-                        <input type="radio" name="rest-alunos" value="ondina"> Ondina
-                    </label>
-                    <label class="radio" onclick="selectRadio(this, 'rest-alunos')">
-                        <input type="radio" name="rest-alunos" value="sao_lazaro"> São Lázaro
-                    </label>
-                </div>
-            </div>
-            <button type="submit" class="btn" id="btn-alunos">Buscar na planilha</button>
-        </form>
-
-        <div class="loading" id="loading-alunos">
-            <div class="spinner"></div>
-            Lendo a planilha...
-        </div>
-
-        <div class="error-msg" id="error-alunos"></div>
-
-        <div id="result-alunos"></div>
-    </div>
-
     <div class="panel" id="panel-duplicado">
         <div style="font-size:12px;color:#999;margin-bottom:14px;">
             Quando a empresa devolve duas listas escaneadas do <strong>mesmo lote e
@@ -2012,6 +2010,7 @@ function selectRadio(el, name) {
 
     if (name === 'rest-template') {
         var val = el.querySelector('input').value;
+        atualizarFonteTemplate();
         var isFdsEsp = val === 'canela_fds_especial' || val === 'sao_lazaro_fds_especial' || val === 'ondina_fds_especial';
         document.getElementById('dias-especial-section').style.display = isFdsEsp ? '' : 'none';
         if (!isFdsEsp) {
@@ -2026,6 +2025,53 @@ function selectRadio(el, name) {
     if (name === 'rest-duplicado') {
         carregarLotesDup();
     }
+}
+
+// Restaurantes que têm lista na planilha SERVIÇO ALIMENTAÇÃO (FDS PDCA/PDSL não têm).
+var FONTE_PLANILHA = {
+    canela: ['canela'], ondina: ['ondina'], sao_lazaro: ['sao_lazaro'],
+    ondina_fds_especial: ['ondina'], todos: ['canela', 'ondina', 'sao_lazaro'],
+};
+var NOMES_REST = { canela: 'Canela', ondina: 'Ondina', sao_lazaro: 'São Lázaro' };
+
+function fonteTemplate() {
+    return document.querySelector('input[name="fonte-template"]:checked').value;
+}
+
+function selectFonteTemplate(el) {
+    if (el.classList.contains('disabled')) return;
+    el.closest('.radio-group').querySelectorAll('.radio').forEach(r => r.classList.remove('selected'));
+    el.classList.add('selected');
+    el.querySelector('input').checked = true;
+    atualizarFonteTemplate();
+}
+
+function atualizarFonteTemplate() {
+    var rest = document.querySelector('input[name="rest-template"]:checked').value;
+    var origens = FONTE_PLANILHA[rest];
+    var optPlanilha = document.getElementById('fonte-planilha-opt');
+    var optArquivo = document.getElementById('fonte-arquivo-opt');
+
+    // Sem lista na planilha (FDS PDCA/PDSL): só upload.
+    optPlanilha.classList.toggle('disabled', !origens);
+    optPlanilha.style.opacity = origens ? '' : '0.4';
+    optPlanilha.style.pointerEvents = origens ? '' : 'none';
+    if (!origens && optPlanilha.classList.contains('selected')) {
+        optPlanilha.classList.remove('selected');
+        optArquivo.classList.add('selected');
+        optArquivo.querySelector('input').checked = true;
+    }
+
+    var usaPlanilha = fonteTemplate() === 'planilha';
+    document.getElementById('upload-template-wrap').style.display = usaPlanilha ? 'none' : '';
+    document.getElementById('fonte-planilha-info').style.display = (usaPlanilha && origens) ? '' : 'none';
+
+    var links = '';
+    (origens || []).forEach(function(o) {
+        links += ' <a href="/buscar_alunos/download?restaurante=' + o + '">Baixar lista' +
+            (origens.length > 1 ? ' ' + NOMES_REST[o] : '') + ' (.xlsx)</a>';
+    });
+    document.getElementById('fonte-planilha-links').innerHTML = links;
 }
 
 function toggleDiaEspecial(el) {
@@ -2186,12 +2232,18 @@ function submitTemplate(e) {
     var data = new FormData(form);
     data.set('restaurante', form.querySelector('input[name="rest-template"]:checked').value);
 
-    var alunos = form.querySelector('input[name="alunos"]');
-    if (!alunos.files.length) {
-        showError('template', 'Selecione a planilha de alunos.');
-        return false;
+    var fonte = fonteTemplate();
+    data.set('fonte', fonte);
+    if (fonte === 'arquivo') {
+        var alunos = form.querySelector('input[name="alunos"]');
+        if (!alunos.files.length) {
+            showError('template', 'Selecione a planilha de alunos.');
+            return false;
+        }
+        data.set('alunos', alunos.files[0]);
+    } else {
+        data.delete('alunos');
     }
-    data.set('alunos', alunos.files[0]);
 
     var isFdsEsp = data.get('restaurante').endsWith('_fds_especial');
     if (isFdsEsp) {
@@ -2973,67 +3025,6 @@ function substituirSemana() {
 
 // --- Unir listas duplicadas ---------------------------------------------
 
-function escAlunos(t) {
-    return String(t == null ? '' : t).replace(/[&<>"]/g, function(c) {
-        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
-    });
-}
-
-function submitBuscarAlunos(e) {
-    e.preventDefault();
-    var restaurante = document.querySelector('input[name="rest-alunos"]:checked').value;
-
-    showLoading('alunos', true);
-    hideError('alunos');
-    document.getElementById('result-alunos').innerHTML = '';
-
-    fetch('/buscar_alunos', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ restaurante: restaurante }),
-    })
-        .then(r => r.json())
-        .then(data => {
-            showLoading('alunos', false);
-            if (data.erro) { showError('alunos', data.erro); return; }
-            renderAlunos(data, restaurante);
-        })
-        .catch(function(err) {
-            showLoading('alunos', false);
-            showError('alunos', 'Erro de conexão: ' + err.message);
-        });
-    return false;
-}
-
-function renderAlunos(d, restaurante) {
-    function lista(titulo, itens, extra) {
-        if (!itens.length) return '';
-        var h = '<details style="margin-top:10px;font-size:13px;"><summary style="cursor:pointer;">' +
-            titulo + ' (' + itens.length + ')</summary><ul style="margin:6px 0 0 18px;color:#555;">';
-        itens.forEach(function(a) {
-            h += '<li>' + escAlunos(a.nome) + ' — ' + escAlunos(a.matricula || 'sem matrícula') +
-                ' <span style="color:#999">(linha ' + a.linha + (extra ? extra(a) : '') + ')</span></li>';
-        });
-        return h + '</ul></details>';
-    }
-
-    var html = '<div style="font-size:15px;margin:16px 0 6px;"><strong>' + d.total +
-        '</strong> estudantes únicos encontrados</div>' +
-        '<a class="btn-download" href="/buscar_alunos/download?restaurante=' +
-        encodeURIComponent(restaurante) + '">Baixar lista (.xlsx)</a>';
-
-    html += lista('Duplicados removidos', d.duplicados, function(a) {
-        return a.linha_original ? ', já na linha ' + a.linha_original : '';
-    });
-    html += lista('Sem matrícula', d.sem_matricula);
-    html += lista('Coluna LOCAL diferente da aba', d.outro_local, function(a) {
-        return ', local: ' + escAlunos(a.local);
-    });
-    html += lista('Todos os estudantes', d.alunos);
-
-    document.getElementById('result-alunos').innerHTML = html;
-}
-
 var lotesCarregadosDup = [];
 
 function carregarLotesDup() {
@@ -3245,6 +3236,7 @@ document.getElementById('upload-scan-zone').addEventListener('dragover', functio
 document.getElementById('upload-scan-zone').addEventListener('dragleave', function() {
     this.classList.remove('dragover');
 });
+atualizarFonteTemplate();
 </script>
 
 </body>

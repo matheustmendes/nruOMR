@@ -75,3 +75,11 @@ formulario_justificativas:
   coluna_comprovante: "Comprovante de Ausência"
   coluna_parecer: "Parecer"
   coluna_comentario: "Comentário (Se negado )"
+
+# Respostas aprovadas/reprovadas das justificativas (planilha da coordenação,
+# colunas APROVADO / REPROVADO). Usada por cruzar_justificativas.py para
+# preencher "Justificativa aprovada?" nas abas mensais. Compartilhe com o
+# client_email das credenciais (Leitor). `aba` vazio = primeira aba.
+justificativas_aprovadas:
+  spreadsheet_id: "10KzwtmrG9xInrP2xOVQ-VgVOC1veMXwQabhPe-ioLqM"
+  aba: ""

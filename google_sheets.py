@@ -59,7 +59,8 @@ _BRANCO        = {"red": 1.0,  "green": 1.0,  "blue": 1.0}
 
 # --- Geometria do layout horizontal ---
 _PREFIXO_PERIODO = "Período: "
-_COL_FIXAS       = 7   # Nº, Nome, Matrícula, Presenças no Mês, Justificou Ausência?, Justificativa, Qtd. dias justificados
+_COL_FIXAS       = 8   # Nº, Nome, Matrícula, Presenças no Mês, Justificou Ausência?, Justificativa, Qtd. dias justificados, Justificativa aprovada?
+_COL_CONGELADAS  = 7   # colunas congeladas na rolagem (a H é de preenchimento, rola com os períodos)
 _LINHA_PERIODO   = 1   # 1-indexed
 _LINHA_CABECALHO = 2
 _LINHA_DADOS     = 3   # primeira linha de aluno
@@ -67,12 +68,24 @@ _LINHA_DADOS     = 3   # primeira linha de aluno
 # Layout de referência: planilha da Ondina.
 _CABECALHO_FIXO = [
     "Nº", "Nome", "Matrícula", "Presenças no Mês", "Justificou Ausência?",
-    "Justificativa", "Quantidade de dias justificados",
+    "Justificativa", "Quantidade de dias justificados", "Justificativa aprovada?",
 ]
 _COL_PRESENCAS_MES      = _CABECALHO_FIXO.index("Presenças no Mês")
 _COL_FREQUENCIA         = _CABECALHO_FIXO.index("Justificou Ausência?")
 _COL_JUSTIFICATIVA      = _CABECALHO_FIXO.index("Justificativa")
 _COL_DIAS_JUSTIFICADOS  = _CABECALHO_FIXO.index("Quantidade de dias justificados")
+_COL_APROVADA           = _CABECALHO_FIXO.index("Justificativa aprovada?")
+
+# Valores da coluna "Justificativa aprovada?" (preenchida por cruzar_justificativas.py;
+# a coordenadora também pode digitar). Vazio = a pessoa não enviou justificativa.
+APROVADA_SIM, APROVADA_NAO, APROVADA_PENDENTE = "Sim", "Não", "Pendente"
+
+# Nomes das visões de filtro criadas em cada aba mensal (coluna Justificativa).
+# título da visão -> valor da coluna Justificativa que ela mostra
+_FILTROS_JUSTIFICATIVA = {
+    "Justificados": "Justificado",
+    "Não justificados": "Não justificado",
+}
 
 # Presenças mínimas no mês para contar como frequente (10 conta; 9 não).
 _LIMITE_FREQUENCIA = 10
@@ -127,13 +140,22 @@ def _formula_frequencia(linha):
 
 
 def _formula_justificativa(linha):
-    """Coluna F: frequente, justificado (dias justificados fecham o limite) ou não."""
+    """
+    Coluna F: frequente; justificado (justificativa aprovada, ou dias
+    justificados que fecham o limite); ou não justificado.
+
+    A aprovação vale por si só: muita justificativa aprovada não traz datas
+    contáveis ("estágio durante todo o mês"), e nesse caso a decisão da
+    coordenação é o que conta, não a soma de dias.
+    """
     d = _col_letra(_COL_PRESENCAS_MES)
     g = _col_letra(_COL_DIAS_JUSTIFICADOS)
+    h = _col_letra(_COL_APROVADA)
     lim = _LIMITE_FREQUENCIA
     return (
         f'=IF({d}{linha}>={lim};"Frequente";'
-        f'IF({d}{linha}+{g}{linha}>={lim};"Justificado";"Não justificado"))'
+        f'IF(OR({h}{linha}="{APROVADA_SIM}";{d}{linha}+{g}{linha}>={lim});'
+        f'"Justificado";"Não justificado"))'
     )
 
 
@@ -666,7 +688,7 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
         updates.append({
             "range":  f"A{novos[0]['linha']}:{_ULTIMA_FIXA}{linha_fim}",
             "values": [
-                [n["num"], n["nome"], n["mat"]] + _formulas_colunas_fixas(n["linha"]) + [""]
+                [n["num"], n["nome"], n["mat"]] + _formulas_colunas_fixas(n["linha"]) + ["", ""]
                 for n in novos
             ],
         })
@@ -686,7 +708,7 @@ def _escrever_grupo(aba, col_inicio, periodo, ordem_dias, matriz, novos, linha_f
 # --- Formatação ------------------------------------------------------------
 
 def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
-    """Congela linhas 1–2 / colunas A–E e formata o cabeçalho fixo."""
+    """Congela linhas 1–2 / colunas A–G, formata o cabeçalho fixo e recria as visões de filtro."""
     sheet_id = aba.id
     borda = {"style": "SOLID", "width": 1, "color": _COR_BORDA}
 
@@ -703,7 +725,7 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
             "updateSheetProperties": {
                 "properties": {
                     "sheetId": sheet_id,
-                    "gridProperties": {"frozenRowCount": 2, "frozenColumnCount": _COL_FIXAS},
+                    "gridProperties": {"frozenRowCount": 2, "frozenColumnCount": _COL_CONGELADAS},
                 },
                 "fields": "gridProperties(frozenRowCount,frozenColumnCount)",
             }
@@ -712,8 +734,10 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
         # agora e recoloca (coluna Justificativa) no fim.
         {"clearBasicFilter": {"sheetId": sheet_id}},
         # A1:G1 — faixa vazia acima do cabeçalho fixo
+        # (mescla só até a borda do congelamento: o Sheets recusa mesclar
+        # colunas congeladas com não congeladas)
         {"unmergeCells": {"range": rng(0, 1)}},
-        {"mergeCells": {"range": rng(0, 1), "mergeType": "MERGE_ALL"}},
+        {"mergeCells": {"range": rng(0, 1, c1=_COL_CONGELADAS), "mergeType": "MERGE_ALL"}},
         {
             "repeatCell": {
                 "range": rng(0, 1),
@@ -789,7 +813,7 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
             }
         }
         for col, px in [(0, 45), (1, 250), (2, 110), (3, 130), (4, 150),
-                        (5, 140), (6, 200)]
+                        (5, 140), (6, 200), (7, 150)]
     ]
 
     requests.append({
@@ -806,7 +830,58 @@ def _formatar_colunas_fixas(spreadsheet, aba, linha_fim):
         }
     })
 
+    # Coluna "Justificativa aprovada?": lista Sim/Não/Pendente (não estrita: a
+    # coordenadora pode escrever outra coisa sem o Sheets recusar).
+    requests.append({
+        "setDataValidation": {
+            "range": rng(_LINHA_DADOS - 1, max(linha_fim, _LINHA_DADOS),
+                         c0=_COL_APROVADA, c1=_COL_APROVADA + 1),
+            "rule": {
+                "condition": {"type": "ONE_OF_LIST", "values": [
+                    {"userEnteredValue": v}
+                    for v in (APROVADA_SIM, APROVADA_NAO, APROVADA_PENDENTE)]},
+                "showCustomUi": True, "strict": False,
+            },
+        }
+    })
+
     spreadsheet.batch_update({"requests": requests})
+    _aplicar_filtros_justificativa(spreadsheet, aba, linha_fim)
+
+
+def _aplicar_filtros_justificativa(spreadsheet, aba, linha_fim):
+    """
+    Cria (ou recria) as visões de filtro "Justificados" e "Não justificados" na
+    aba: a coordenadora abre Dados → Visões de filtro e escolhe uma, sem mexer
+    na visão dos outros usuários (o filtro básico, ao contrário, é compartilhado
+    e esconde linhas para todo mundo que estiver com a planilha aberta).
+    """
+    meta = _com_retry(spreadsheet.fetch_sheet_metadata)
+    existentes = next(
+        (sh.get("filterViews", []) for sh in meta.get("sheets", [])
+         if sh["properties"]["sheetId"] == aba.id), [])
+
+    requests = [
+        {"deleteFilterView": {"filterId": fv["filterViewId"]}}
+        for fv in existentes if fv.get("title") in _FILTROS_JUSTIFICATIVA
+    ]
+    for titulo, valor in _FILTROS_JUSTIFICATIVA.items():
+        requests.append({"addFilterView": {"filter": {
+            "title": titulo,
+            "range": {
+                "sheetId": aba.id,
+                "startRowIndex": _LINHA_CABECALHO - 1,
+                "endRowIndex": max(linha_fim, _LINHA_DADOS),
+                "startColumnIndex": 0,
+                "endColumnIndex": aba.col_count,
+            },
+            "filterSpecs": [{
+                "columnIndex": _COL_JUSTIFICATIVA,
+                "filterCriteria": {"condition": {
+                    "type": "TEXT_EQ", "values": [{"userEnteredValue": valor}]}},
+            }],
+        }}})
+    _com_retry(lambda: spreadsheet.batch_update({"requests": requests}))
 
 
 def _aplicar_formatacao_horizontal(spreadsheet, aba, col_inicio, num_dias, linha_fim):

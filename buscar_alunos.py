@@ -29,11 +29,13 @@ import google_sheets as gs
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# restaurante_key -> (nome da aba na planilha, nome no cabeçalho da lista)
+# restaurante_key -> (abas da planilha, nome no cabeçalho da lista)
+# Ondina tem duas abas oficiais ("ONDINA" e "Lista Ondina - NOVA"): a lista é a
+# soma das duas, sem repetidos. A ordem importa: na repetição vale a primeira.
 RESTAURANTES = {
-    "ondina": ("ONDINA", "ONDINA"),
-    "canela": ("CANELA", "CANELA"),
-    "sao_lazaro": ("SÃO LÁZARO", "SÃO LÁZARO"),
+    "ondina": (["ONDINA", "Lista Ondina - NOVA"], "ONDINA"),
+    "canela": (["CANELA"], "CANELA"),
+    "sao_lazaro": (["SÃO LÁZARO"], "SÃO LÁZARO"),
 }
 
 # Linha só com nome (sem matrícula/curso/auxílio/local) que casa com isto é
@@ -74,10 +76,10 @@ def _celula(linha, col):
     return linha[col].strip() if col is not None and col < len(linha) else ""
 
 
-def ler_aba(valores):
+def ler_aba(valores, origem=""):
     """
     Devolve (alunos, titulos_ignorados), sem deduplicar.
-    alunos: lista de dicts {nome, matricula, curso, local, linha}.
+    alunos: lista de dicts {nome, matricula, curso, local, linha, aba}.
     """
     cab = _achar_cabecalho(valores)
     if cab is None:
@@ -104,6 +106,7 @@ def ler_aba(valores):
             "curso": curso,
             "local": local,
             "linha": i + 1,
+            "aba": origem,
         })
     return alunos, titulos
 
@@ -139,9 +142,13 @@ def deduplicar(alunos):
     return unicos, duplicados
 
 
+def _achar_aba(abas, nome):
+    return next((a for a in abas if _norm_texto(a.title) == _norm_texto(nome)), None)
+
+
 def buscar(restaurante_key, spreadsheet_id=None, verbose=True):
-    """Lê a aba do restaurante e devolve {alunos, duplicados, titulos, ...}."""
-    nome_aba, _ = RESTAURANTES[restaurante_key]
+    """Lê as abas do restaurante e devolve {alunos, duplicados, titulos, ...}."""
+    nomes_abas, rotulo = RESTAURANTES[restaurante_key]
     config = gs._carregar_config()
     spreadsheet_id = spreadsheet_id or config.get("bolsistas", {}).get("spreadsheet_id", "").strip()
     if not spreadsheet_id:
@@ -149,33 +156,40 @@ def buscar(restaurante_key, spreadsheet_id=None, verbose=True):
 
     cliente = gs._obter_cliente(config)
     planilha = gs._com_retry(lambda: cliente.open_by_key(spreadsheet_id))
-    aba = next(
-        (a for a in gs._com_retry(planilha.worksheets)
-         if _norm_texto(a.title) == _norm_texto(nome_aba)),
-        None,
-    )
-    if aba is None:
-        raise ValueError(f"Aba '{nome_aba}' não encontrada na planilha '{planilha.title}'")
+    abas = gs._com_retry(planilha.worksheets)
 
-    valores = gs._com_retry(aba.get_all_values)
-    brutos, titulos = ler_aba(valores)
+    brutos, titulos, por_aba = [], [], {}
+    for nome_aba in nomes_abas:
+        aba = _achar_aba(abas, nome_aba)
+        if aba is None:
+            raise ValueError(f"Aba '{nome_aba}' não encontrada na planilha '{planilha.title}'")
+        valores = gs._com_retry(aba.get_all_values)
+        da_aba, tit = ler_aba(valores, origem=aba.title.strip())
+        brutos += da_aba
+        titulos += tit
+        por_aba[aba.title.strip()] = len(da_aba)
+
     unicos, duplicados = deduplicar(brutos)
+    # A planilha vem em blocos (lista principal, SAT, PEC...), mas a lista
+    # impressa é uma só, em ordem alfabética (sem acento, sem diferença de caixa).
+    unicos.sort(key=lambda a: (_norm_texto(a["nome"]), _norm_mat(a["matricula"])))
 
     sem_mat = [a for a in unicos if not _norm_mat(a["matricula"])]
     outro_local = [
         a for a in unicos
-        if a["local"] and _norm_texto(a["local"]) != _norm_texto(RESTAURANTES[restaurante_key][1])
+        if a["local"] and _norm_texto(a["local"]) != _norm_texto(rotulo)
     ]
 
     if verbose:
-        print(f"[{restaurante_key}] aba '{aba.title.strip()}': {len(brutos)} linhas com nome, "
+        detalhe = ", ".join(f"'{n}': {q}" for n, q in por_aba.items())
+        print(f"[{restaurante_key}] {len(brutos)} linhas com nome ({detalhe}), "
               f"{len(duplicados)} duplicadas, {len(unicos)} estudantes únicos")
         print(f"  {len(titulos)} linha(s) de título ignoradas; "
               f"{len(sem_mat)} sem matrícula; "
               f"{len(outro_local)} com coluna LOCAL diferente da aba")
         for dup, orig in duplicados[:10]:
-            ref = f" (já na linha {orig['linha']})" if orig else ""
-            print(f"    duplicado: linha {dup['linha']} {dup['nome']} {dup['matricula']}{ref}")
+            ref = f" (já em '{orig['aba']}' linha {orig['linha']})" if orig else ""
+            print(f"    duplicado: '{dup['aba']}' linha {dup['linha']} {dup['nome']} {dup['matricula']}{ref}")
         if len(duplicados) > 10:
             print(f"    ... e mais {len(duplicados) - 10}")
 
@@ -186,6 +200,7 @@ def buscar(restaurante_key, spreadsheet_id=None, verbose=True):
         "titulos": titulos,
         "sem_matricula": sem_mat,
         "outro_local": outro_local,
+        "por_aba": por_aba,
     }
 
 

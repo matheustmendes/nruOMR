@@ -49,6 +49,7 @@ import lote as lote_mod
 import corrigir_passivo
 from reconciliar import releitura_correta
 from fundir_duplicados import unir_contagens
+import buscar_alunos as buscar_alunos_mod
 
 
 app = Flask(__name__)
@@ -821,6 +822,48 @@ def rota_download():
     return send_file(caminho, as_attachment=True, download_name=nome)
 
 
+@app.route("/buscar_alunos", methods=["POST"])
+def rota_buscar_alunos():
+    """Busca os estudantes do restaurante na planilha SERVIÇO ALIMENTAÇÃO, sem duplicados."""
+    dados = request.get_json(silent=True) or {}
+    restaurante = dados.get("restaurante", "")
+    if restaurante not in buscar_alunos_mod.RESTAURANTES:
+        return jsonify({"erro": "Restaurante inválido."}), 400
+    try:
+        res = buscar_alunos_mod.buscar(restaurante, verbose=False)
+        pasta = tempfile.mkdtemp(prefix="alunos_")
+        caminho = buscar_alunos_mod.salvar_xlsx(res, os.path.join(pasta, f"lista_{restaurante}.xlsx"))
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"erro": f"Não foi possível buscar na planilha: {e}"}), 500
+
+    app.config.setdefault("ALUNOS_XLSX", {})[restaurante] = caminho
+
+    def _item(a):
+        return {"nome": a["nome"], "matricula": a["matricula"], "linha": a["linha"],
+                "local": a["local"]}
+
+    return jsonify({
+        "total": len(res["alunos"]),
+        "duplicados": [
+            {**_item(d), "linha_original": o["linha"] if o else None}
+            for d, o in res["duplicados"]
+        ],
+        "sem_matricula": [_item(a) for a in res["sem_matricula"]],
+        "outro_local": [_item(a) for a in res["outro_local"]],
+        "alunos": [_item(a) for a in res["alunos"]],
+    })
+
+
+@app.route("/buscar_alunos/download")
+def rota_buscar_alunos_download():
+    restaurante = request.args.get("restaurante", "")
+    caminho = app.config.get("ALUNOS_XLSX", {}).get(restaurante)
+    if not caminho or not os.path.exists(caminho):
+        return "Nenhuma lista gerada para este restaurante", 404
+    return send_file(caminho, as_attachment=True, download_name=f"lista_{restaurante}.xlsx")
+
+
 @app.route("/lotes")
 def rota_lotes():
     """Lotes disponíveis para processar, mais recentes primeiro."""
@@ -1451,6 +1494,7 @@ body {
         <button class="tab" onclick="switchTab('recuperar', this)">Recuperar lote</button>
         <button class="tab" onclick="switchTab('limpar', this)">Limpar lotes antigos</button>
         <button class="tab" onclick="switchTab('duplicado', this); carregarLotesDup();">Unir listas duplicadas</button>
+        <button class="tab" onclick="switchTab('alunos', this)">Buscar alunos</button>
     </div>
 
     <!-- ABA: GERAR TEMPLATE -->
@@ -1806,6 +1850,43 @@ body {
         <div class="error-msg" id="error-limpar"></div>
 
         <div id="result-limpar"></div>
+    </div>
+
+    <div class="panel" id="panel-alunos">
+        <div style="font-size:12px;color:#999;margin-bottom:14px;">
+            Busca os estudantes direto na planilha <strong>SERVIÇO ALIMENTAÇÃO</strong>
+            (aba do restaurante), ignora as linhas de título (SAT, PEC-G etc.) e
+            remove os duplicados. O arquivo baixado já está no formato do
+            <strong>Gerar template</strong> — dá pra enviar direto lá, sem copiar
+            e colar entre planilhas.
+        </div>
+
+        <form id="form-alunos" onsubmit="return submitBuscarAlunos(event)">
+            <div class="section">
+                <div class="label">Restaurante</div>
+                <div class="radio-group">
+                    <label class="radio selected" onclick="selectRadio(this, 'rest-alunos')">
+                        <input type="radio" name="rest-alunos" value="canela" checked> Canela
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-alunos')">
+                        <input type="radio" name="rest-alunos" value="ondina"> Ondina
+                    </label>
+                    <label class="radio" onclick="selectRadio(this, 'rest-alunos')">
+                        <input type="radio" name="rest-alunos" value="sao_lazaro"> São Lázaro
+                    </label>
+                </div>
+            </div>
+            <button type="submit" class="btn" id="btn-alunos">Buscar na planilha</button>
+        </form>
+
+        <div class="loading" id="loading-alunos">
+            <div class="spinner"></div>
+            Lendo a planilha...
+        </div>
+
+        <div class="error-msg" id="error-alunos"></div>
+
+        <div id="result-alunos"></div>
     </div>
 
     <div class="panel" id="panel-duplicado">
@@ -2891,6 +2972,67 @@ function substituirSemana() {
 }
 
 // --- Unir listas duplicadas ---------------------------------------------
+
+function escAlunos(t) {
+    return String(t == null ? '' : t).replace(/[&<>"]/g, function(c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+    });
+}
+
+function submitBuscarAlunos(e) {
+    e.preventDefault();
+    var restaurante = document.querySelector('input[name="rest-alunos"]:checked').value;
+
+    showLoading('alunos', true);
+    hideError('alunos');
+    document.getElementById('result-alunos').innerHTML = '';
+
+    fetch('/buscar_alunos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ restaurante: restaurante }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            showLoading('alunos', false);
+            if (data.erro) { showError('alunos', data.erro); return; }
+            renderAlunos(data, restaurante);
+        })
+        .catch(function(err) {
+            showLoading('alunos', false);
+            showError('alunos', 'Erro de conexão: ' + err.message);
+        });
+    return false;
+}
+
+function renderAlunos(d, restaurante) {
+    function lista(titulo, itens, extra) {
+        if (!itens.length) return '';
+        var h = '<details style="margin-top:10px;font-size:13px;"><summary style="cursor:pointer;">' +
+            titulo + ' (' + itens.length + ')</summary><ul style="margin:6px 0 0 18px;color:#555;">';
+        itens.forEach(function(a) {
+            h += '<li>' + escAlunos(a.nome) + ' — ' + escAlunos(a.matricula || 'sem matrícula') +
+                ' <span style="color:#999">(linha ' + a.linha + (extra ? extra(a) : '') + ')</span></li>';
+        });
+        return h + '</ul></details>';
+    }
+
+    var html = '<div style="font-size:15px;margin:16px 0 6px;"><strong>' + d.total +
+        '</strong> estudantes únicos encontrados</div>' +
+        '<a class="btn-download" href="/buscar_alunos/download?restaurante=' +
+        encodeURIComponent(restaurante) + '">Baixar lista (.xlsx)</a>';
+
+    html += lista('Duplicados removidos', d.duplicados, function(a) {
+        return a.linha_original ? ', já na linha ' + a.linha_original : '';
+    });
+    html += lista('Sem matrícula', d.sem_matricula);
+    html += lista('Coluna LOCAL diferente da aba', d.outro_local, function(a) {
+        return ', local: ' + escAlunos(a.local);
+    });
+    html += lista('Todos os estudantes', d.alunos);
+
+    document.getElementById('result-alunos').innerHTML = html;
+}
 
 var lotesCarregadosDup = [];
 

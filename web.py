@@ -404,12 +404,17 @@ def rota_processar():
 
 
 # Restaurantes cuja lista vem da planilha SERVIÇO ALIMENTAÇÃO. As listas de FDS
-# (PDCA/PDSL) são subconjuntos que só existem na planilha de impressão.
+# (PDCA/PDSL) usam a mesma base do restaurante correspondente; os dias e o
+# layout continuam definidos pela configuração da lista de impressão.
 FONTE_PLANILHA_SERVICO = {
     "canela": "canela",
+    "canela_fds": "canela",
+    "canela_fds_especial": "canela",
     "ondina": "ondina",
-    "sao_lazaro": "sao_lazaro",
     "ondina_fds_especial": "ondina",
+    "sao_lazaro": "sao_lazaro",
+    "sao_lazaro_fds": "sao_lazaro",
+    "sao_lazaro_fds_especial": "sao_lazaro",
 }
 
 
@@ -2027,10 +2032,13 @@ function selectRadio(el, name) {
     }
 }
 
-// Restaurantes que têm lista na planilha SERVIÇO ALIMENTAÇÃO (FDS PDCA/PDSL não têm).
+// Cada lista de FDS usa a base de alunos do restaurante correspondente.
 var FONTE_PLANILHA = {
-    canela: ['canela'], ondina: ['ondina'], sao_lazaro: ['sao_lazaro'],
+    canela: ['canela'], canela_fds: ['canela'], canela_fds_especial: ['canela'],
+    ondina: ['ondina'],
     ondina_fds_especial: ['ondina'], todos: ['canela', 'ondina', 'sao_lazaro'],
+    sao_lazaro: ['sao_lazaro'], sao_lazaro_fds: ['sao_lazaro'],
+    sao_lazaro_fds_especial: ['sao_lazaro'],
 };
 var NOMES_REST = { canela: 'Canela', ondina: 'Ondina', sao_lazaro: 'São Lázaro' };
 
